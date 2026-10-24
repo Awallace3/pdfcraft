@@ -15,7 +15,8 @@ use base64::Engine;
 use crate::XfaError;
 use crate::data::{DataNode, data_date_letters, data_path, data_to_iso, date_letters, is_on, iso_to_pattern};
 use crate::model::{
-    Area, Border, ChoiceList, Common, Draw, ExclGroup, Field, Font, HAlign, Layout, Node, Occur, PageArea, Para, Rect, Script, Subform, Template, Ui,
+    Access, Area, Border, ChoiceList, Common, Draw, ExclGroup, Field, Font, HAlign, Layout, Margin, Node, Occur, PageArea, PageRole, Para, Placement,
+    Presence, Rect, Script, SomIndices, Stroke, Subform, Template, Ui, VAlign, Value,
 };
 use crate::text::{self, Block, Face, Span};
 
