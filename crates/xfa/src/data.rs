@@ -444,10 +444,10 @@ pub fn pattern_to_iso(text: &str, pattern: &str) -> Option<String> {
                 let width = if fixed {
                     t.len()
                 } else {
-                    rest.chars().take_while(|c| c.is_ascii_digit()).count().min(if t == "d" || t == "m" { 2 } else { 4 })
+                    rest.chars().take_while(char::is_ascii_digit).count().min(if t == "d" || t == "m" { 2 } else { 4 })
                 };
                 let digits: String = rest.chars().take(width).collect();
-                if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+                if digits.is_empty() || !digits.chars().all(char::is_ascii_digit) {
                     return None;
                 }
                 let v: u32 = digits.parse().ok()?;

@@ -616,14 +616,7 @@ fn unlink_from_forms(doc: &mut Document, holders: &[ObjRef], doomed: &HashSet<Ob
                 continue;
             }
             let data = form.decoded()?;
-            let mut pruned = false;
-            for name in doomed_names {
-                match content_draws(doc, std::slice::from_ref(&data), &xo, &name, 0, &mut HashSet::new()) {
-                    Some(true) => {}
-                    Some(false) => pruned |= xo.remove(&name).is_some(),
-                    None => return Err(CosError::Syntax { offset: 0, detail: "redaction could not fully inspect shared form resources".into() }),
-                }
-            }
+            let mut pruned = prune_doomed_xobjects(doc, &data, &mut xo, &doomed_names)?;
             if pruned {
                 res.set(b"XObject".to_vec(), Object::Dict(xo));
             }
@@ -635,6 +628,18 @@ fn unlink_from_forms(doc: &mut Document, holders: &[ObjRef], doomed: &HashSet<Ob
         }
     }
     Ok(())
+}
+
+fn prune_doomed_xobjects(doc: &Document, data: &[u8], xo: &mut Dict, doomed_names: &[Vec<u8>]) -> Result<bool, CosError> {
+    let mut pruned = false;
+    for name in doomed_names {
+        match content_draws(doc, std::slice::from_ref(&data), xo, name, 0, &mut HashSet::new()) {
+            Some(true) => {}
+            Some(false) => pruned |= xo.remove(name).is_some(),
+            None => return Err(CosError::Syntax { offset: 0, detail: "redaction could not fully inspect shared form resources".into() }),
+        }
+    }
+    Ok(pruned)
 }
 
 /// The clip that hides everything inside each region: one even-odd clip per region (a big

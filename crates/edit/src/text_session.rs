@@ -3,7 +3,10 @@
 //! another one's output; the commit writes into the document it was opened on, and refuses if
 //! that document has changed since.
 
-use super::*;
+use super::{
+    group_blocks, layout_draft, rewrite_block_from, text_lines, BlockStyle, Document, EditError, LineEdit,
+    TextBlock, TextEditLayout, TextLine, MAX_TYPE3_GLYPHS,
+};
 
 /// One paragraph being edited: the document as it was opened, and the page's lines then.
 pub struct TextSession {

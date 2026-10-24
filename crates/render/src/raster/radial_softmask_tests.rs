@@ -1,4 +1,6 @@
-use super::*;
+use std::sync::Arc;
+
+use super::{PageRenderer, RenderConfig, RenderRequest, RenderedPage, Tile};
 
 fn masked_shading(shading: &str, extra: &str, ink: &str) -> Vec<u8> {
     let content = format!("20.25 20.25 279.5 279.5 re W n /M gs {ink} 0 0 320 320 re f");

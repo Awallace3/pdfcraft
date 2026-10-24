@@ -1,6 +1,15 @@
 //! Geometry-based regions and mixed-style rewriting of existing text.
 
-use super::*;
+use std::collections::HashMap;
+
+use pdfcraft_cos::{Dict, Document, Object, PdfString};
+
+use super::{
+    coincident_ops, content_streams, needs_type3, no_japanese_font, page_dict, reveal_ops, rewritten_contents,
+    source_encodes, source_family, source_program, source_show, source_space, source_width, splice, type3_font,
+    union, BlockStyle, EditError, LineEdit, Matrix, Metrics, Op, Pieces, RangeStyle, TextBlock, TextLine,
+    MAX_TYPE3_GLYPHS,
+};
 
 fn same_plane(a: &TextLine, b: &TextLine) -> bool {
     let at = Matrix(a.origin.tm).then(&Matrix(a.origin.ctm));
@@ -166,8 +175,8 @@ fn opens_with_marker(text: &str) -> bool {
     if !first.is_ascii_digit() && !first.is_ascii_alphabetic() {
         return false;
     }
-    let digits = text.chars().take_while(|c| c.is_ascii_digit()).count();
-    let letters = text.chars().take_while(|c| c.is_ascii_alphabetic()).count();
+    let digits = text.chars().take_while(char::is_ascii_digit).count();
+    let letters = text.chars().take_while(char::is_ascii_alphabetic).count();
     // Both runs are ASCII characters, so their length in characters is their length in bytes:
     // the slice below starts on a character boundary.
     let rest = if digits > 0 {
@@ -178,7 +187,7 @@ fn opens_with_marker(text: &str) -> bool {
         return false;
     };
     let mut after = rest.chars();
-    matches!(after.next(), Some('.' | ')')) && after.next().is_none_or(|c| c.is_whitespace())
+    matches!(after.next(), Some('.' | ')')) && after.next().is_none_or(char::is_whitespace)
 }
 
 /// A row that opens with a list marker opens its own item: joining it to the row above is what
