@@ -4,8 +4,8 @@
 //! that document has changed since.
 
 use super::{
-    group_blocks, layout_draft, rewrite_block_from, text_lines, BlockStyle, Document, EditError, LineEdit,
-    TextBlock, TextEditLayout, TextLine, MAX_TYPE3_GLYPHS,
+    BlockStyle, Document, EditError, LineEdit, MAX_TYPE3_GLYPHS, TextBlock, TextEditLayout, TextLine, group_blocks, layout_draft, rewrite_block_from,
+    text_lines,
 };
 
 /// One paragraph being edited: the document as it was opened, and the page's lines then.

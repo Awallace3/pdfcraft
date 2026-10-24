@@ -1,9 +1,8 @@
 use pdfcraft_cos::{Dict, Document, Object, Stream};
 
 use super::{
-    added, add_header_footer, add_watermark, contents, is_wrap_close, page_list, place_tagged, remove_marks,
-    stamp, stream_bytes, stream_tag, wrapper_role, Context, EditError, HeaderFooter, MarkKind, Watermark,
-    ISOLATION_MAX_DEPTH, OLD_WRAP_CLOSE, WRAP_CLOSE, WRAP_OPEN,
+    Context, EditError, HeaderFooter, ISOLATION_MAX_DEPTH, MarkKind, OLD_WRAP_CLOSE, WRAP_CLOSE, WRAP_OPEN, Watermark, add_header_footer,
+    add_watermark, added, contents, is_wrap_close, page_list, place_tagged, remove_marks, stamp, stream_bytes, stream_tag, wrapper_role,
 };
 
 fn fixture(parts: &[&[u8]]) -> Document {

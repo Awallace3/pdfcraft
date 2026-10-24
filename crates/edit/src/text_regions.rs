@@ -5,10 +5,9 @@ use std::collections::HashMap;
 use pdfcraft_cos::{Dict, Document, Object, PdfString};
 
 use super::{
-    coincident_ops, content_streams, needs_type3, no_japanese_font, page_dict, reveal_ops, rewritten_contents,
-    source_encodes, source_family, source_program, source_show, source_space, source_width, splice, type3_font,
-    union, BlockStyle, EditError, LineEdit, Matrix, Metrics, Op, Pieces, RangeStyle, TextBlock, TextLine,
-    MAX_TYPE3_GLYPHS,
+    BlockStyle, EditError, LineEdit, MAX_TYPE3_GLYPHS, Matrix, Metrics, Op, Pieces, RangeStyle, TextBlock, TextLine, coincident_ops, content_streams,
+    needs_type3, no_japanese_font, page_dict, reveal_ops, rewritten_contents, source_encodes, source_family, source_program, source_show,
+    source_space, source_width, splice, type3_font, union,
 };
 
 fn same_plane(a: &TextLine, b: &TextLine) -> bool {
