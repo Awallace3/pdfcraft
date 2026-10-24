@@ -58,7 +58,7 @@ pub fn strength(pw: &str) -> (&'static str, Color32) {
     let classes = [
         pw.chars().any(char::is_lowercase),
         pw.chars().any(char::is_uppercase),
-        pw.chars().any(char::is_ascii_digit),
+        pw.chars().any(|c| c.is_ascii_digit()),
         pw.chars().any(|c| !c.is_alphanumeric()),
     ]
     .iter()

@@ -1,11 +1,6 @@
-use std::sync::Arc;
+use super::*;
+use pdfcraft_cos::{Algorithm, NewEncryption, XrefEntry, write_full, write_incremental};
 use std::sync::atomic::Ordering;
-
-use pdfcraft_cos::{Algorithm, Dict, Document, NewEncryption, ObjRef, Object, SaveOptions, Stream, XrefEntry, write_full, write_incremental};
-
-use super::{
-    DISCOVERY_CACHE_LIMIT, DigestCache, DssEvidence, MAX_DSS_BYTES, MAX_DSS_ENTRIES, TrustStore, is_document_timestamp, list_cached, only_grew,
-};
 
 const STAMP: &str = "<< /Type /Sig /SubFilter /ETSI.RFC3161 /ByteRange [0 1 2 1] >>";
 

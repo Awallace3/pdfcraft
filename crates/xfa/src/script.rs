@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 use pdfcraft_cos::{Dict, Document, Object, PdfString};
 
 use crate::data::{DataNode, data_path, parse_datasets};
-use crate::model::{Access, Area, Draw, ExclGroup, Field, Node, Presence, Script, Subform, Template};
+use crate::model::*;
 use crate::{Report, XfaError};
 
 /// Private key on the AcroForm: presence scripts set, by SOM path.

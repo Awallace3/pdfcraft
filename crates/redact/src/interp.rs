@@ -444,7 +444,7 @@ fn content_draws(doc: &Document, content: &[Vec<u8>], xo: &Dict, name: &[u8], de
             return None;
         }
         let Ok(data) = s.decoded() else { return None };
-        match content_draws(doc, std::slice::from_ref(&data), xo, name, depth + 1, seen) {
+        match content_draws(doc, content, xo, name, depth + 1, seen) {
             Some(false) => {}
             other => return other,
         }
@@ -616,7 +616,7 @@ fn unlink_from_forms(doc: &mut Document, holders: &[ObjRef], doomed: &HashSet<Ob
                 continue;
             }
             let data = form.decoded()?;
-            let mut pruned = prune_doomed_xobjects(doc, &data, &mut xo, &doomed_names)?;
+            let mut pruned = prune_doomed_xobjects(doc, std::slice::from_ref(&data), &mut xo, &doomed_names)?;
             if pruned {
                 res.set(b"XObject".to_vec(), Object::Dict(xo));
             }
@@ -630,10 +630,10 @@ fn unlink_from_forms(doc: &mut Document, holders: &[ObjRef], doomed: &HashSet<Ob
     Ok(())
 }
 
-fn prune_doomed_xobjects(doc: &Document, data: &[u8], xo: &mut Dict, doomed_names: &[Vec<u8>]) -> Result<bool, CosError> {
+fn prune_doomed_xobjects(doc: &Document, content: &[Vec<u8>], xo: &mut Dict, doomed_names: &[Vec<u8>]) -> Result<bool, CosError> {
     let mut pruned = false;
     for name in doomed_names {
-        match content_draws(doc, std::slice::from_ref(&data), xo, name, 0, &mut HashSet::new()) {
+        match content_draws(doc, content, xo, name, 0, &mut HashSet::new()) {
             Some(true) => {}
             Some(false) => pruned |= xo.remove(name).is_some(),
             None => return Err(CosError::Syntax { offset: 0, detail: "redaction could not fully inspect shared form resources".into() }),

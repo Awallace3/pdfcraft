@@ -4,10 +4,7 @@
 
 use std::cell::Cell;
 
-use pdfcraft_cos::{Dict, Document, ObjRef, Object, PdfString};
-
-use super::{AddedText, GLYPHS_PER_FONT, GlyphError, GlyphOutline, LaidLine, Piece, ShapedCluster, ShapedScript, draw_laid_shaped};
-use crate::EditError;
+use super::*;
 
 /// Regression fingerprint for the small-item fixture: drawing bytes, font map and document
 /// objects, with generated streams decoded so Flate backend selection cannot change the hash.
