@@ -92,6 +92,12 @@ has() {
   case " $FORMATS " in *" $format "*) return 0 ;; *) return 1 ;; esac
 }
 
+verify_sha256() {
+  local expected="$1"
+  local target="$2"
+  printf '%s  %s\n' "$expected" "$target" | sha256sum -c -
+}
+
 # ---- .tar.gz ------------------------------------------------------------------------------------
 if has tar; then
   mkdir -p "$WORK/tar"
@@ -154,7 +160,6 @@ if has appimage; then
   ln -s "$APP_ID.png" "$APPDIR/.DirIcon"
 
   TOOL="${APPIMAGETOOL:-$(command -v appimagetool || true)}"
-  SHA_FMT='%s  %s\n'
   if [[ -z "$TOOL" ]]; then
     if [[ -z "$APPIMAGETOOL_SHA256" ]]; then
       echo "no pinned appimagetool for $ARCH; set APPIMAGETOOL or put appimagetool on PATH" >&2
@@ -165,21 +170,21 @@ if has appimage; then
       download="$TOOL.download"
       curl --proto '=https' -fsSL -o "$download" \
         "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-$ARCH.AppImage"
-      printf "$SHA_FMT" "$APPIMAGETOOL_SHA256" "$download" | sha256sum -c -
+      verify_sha256 "$APPIMAGETOOL_SHA256" "$download"
       chmod 755 "$download"
       mv "$download" "$TOOL"
     fi
-    printf "$SHA_FMT" "$APPIMAGETOOL_SHA256" "$TOOL" | sha256sum -c -
+    verify_sha256 "$APPIMAGETOOL_SHA256" "$TOOL"
   fi
   RUNTIME="$CARGO_TARGET_DIR/appimage-runtime-$APPIMAGE_RUNTIME_VERSION-$ARCH"
   if [[ ! -f "$RUNTIME" ]]; then
     download="$RUNTIME.download"
     curl --proto '=https' -fsSL -o "$download" \
       "https://github.com/AppImage/type2-runtime/releases/download/$APPIMAGE_RUNTIME_VERSION/runtime-$ARCH"
-    printf "$SHA_FMT" "$APPIMAGE_RUNTIME_SHA256" "$download" | sha256sum -c -
+    verify_sha256 "$APPIMAGE_RUNTIME_SHA256" "$download"
     mv "$download" "$RUNTIME"
   fi
-  printf "$SHA_FMT" "$APPIMAGE_RUNTIME_SHA256" "$RUNTIME" | sha256sum -c -
+  verify_sha256 "$APPIMAGE_RUNTIME_SHA256" "$RUNTIME"
   # Absolute, because appimagetool runs in $DIST below (CARGO_TARGET_DIR or APPIMAGETOOL may be
   # relative, e.g. target/agent-<name>).
   OUT="$(cd "$DIST" && pwd)/$BASENAME.AppImage"
