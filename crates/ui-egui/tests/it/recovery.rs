@@ -43,7 +43,9 @@ fn store(tag: &str) -> RecoveryStore {
 
 /// Snapshot files (the PDF and its sidecar), not the running instances' lock files.
 fn files_in(s: &RecoveryStore) -> usize {
-    std::fs::read_dir(s.dir()).map(|d| d.flatten().filter(|e| e.path().extension().and_then(|x| x.to_str()) != Some("lock")).count()).unwrap_or(0)
+    std::fs::read_dir(s.dir())
+        .map(|d| d.flatten().filter(|e| e.path().extension().and_then(std::ffi::OsStr::to_str) != Some("lock")).count())
+        .unwrap_or(0)
 }
 
 /// A session that edits a document, autosaves, and then "crashes" (is dropped).
@@ -184,6 +186,13 @@ fn encrypted_documents_are_autosaved_encrypted_and_recovered_with_the_password()
     h.get_by_label_contains("password-protected");
     h.get_by_label("Recover").click();
     support::wait_until(&mut h, "recovery password prompt", |app| app.password_prompt.is_some());
+    // The prompt is laid out in the pass after the one that set it.
+    for _ in 0..10 {
+        if h.query_by_role(Role::PasswordInput).is_some() {
+            break;
+        }
+        h.run_steps(1);
+    }
     let field = h.get_by_role(Role::PasswordInput);
     field.focus();
     field.type_text("pw");
@@ -328,6 +337,12 @@ fn an_encrypted_snapshot_without_metadata_still_requires_its_password() {
     let mut h = harness(s.clone());
     h.get_by_label("Recover").click();
     support::wait_until(&mut h, "orphan recovery password prompt", |app| app.password_prompt.is_some());
+    for _ in 0..10 {
+        if h.query_by_role(Role::PasswordInput).is_some() {
+            break;
+        }
+        h.run_steps(1);
+    }
     assert!(h.state().views.is_empty());
     let field = h.get_by_role(Role::PasswordInput);
     field.focus();

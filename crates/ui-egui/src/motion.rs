@@ -88,11 +88,16 @@ pub struct Motion {
     /// egui's own animation time and scroll animation, kept while they are changed here.
     egui_times: Option<(f32, ScrollAnimation)>,
     wheel: WheelReader,
+    /// This frame's wheel motion, read on its first pass and reused on later passes.
+    ///
+    /// egui empties `RawInput` between the passes of a multi-pass frame, so reading the wheel
+    /// again in a later pass sees nothing and would wipe the scroll/zoom the frame presented.
+    frame: Option<(u64, WheelMotion)>,
 }
 
 impl Default for Motion {
     fn default() -> Self {
-        Self { reduced: false, source: None, asked_at: f64::NEG_INFINITY, egui_times: None, wheel: WheelReader::default() }
+        Self { reduced: false, source: None, asked_at: f64::NEG_INFINITY, egui_times: None, wheel: WheelReader::default(), frame: None }
     }
 }
 
@@ -114,10 +119,21 @@ impl Motion {
         if animate {
             // A gesture begun while easing is egui's to finish.
             self.wheel = WheelReader::default();
+            self.frame = None;
             return;
         }
         let options = ctx.options(|o| o.input_options);
-        let motion = ctx.input(|i| self.wheel.read(&i.events, i.viewport_rect().height(), &options));
+        // One frame may run several passes (`request_discard`). Only the first pass has this
+        // frame's events; the presented pass must still see the same wheel motion.
+        let frame = ctx.cumulative_frame_nr();
+        let motion = match self.frame {
+            Some((read_in, motion)) if read_in == frame => motion,
+            _ => {
+                let motion = ctx.input(|i| self.wheel.read(&i.events, i.viewport_rect().height(), &options));
+                self.frame = Some((frame, motion));
+                motion
+            }
+        };
         ctx.input_mut(|i| i.smooth_scroll_delta = motion.scroll);
         let pass = ctx.cumulative_pass_nr();
         ctx.data_mut(|d| d.insert_temp(zoom_id(), (pass, motion.zoom)));
@@ -149,7 +165,7 @@ pub(crate) fn animated(ctx: &egui::Context) -> bool {
 }
 
 fn zoom_id() -> egui::Id {
-    egui::Id::new("pdfcraft-motion-wheel-zoom")
+    egui::Id::unique("pdfcraft-motion-wheel-zoom")
 }
 
 /// This pass's zoom factor from a pinch or ⌘/Ctrl with the wheel (1.0 for none): egui's
@@ -194,7 +210,7 @@ impl WheelReader {
         let mut modifiers = self.touch.unwrap_or_default();
         for event in events {
             match event {
-                Event::MouseWheel { unit, delta: step, phase, modifiers: latest } => match phase {
+                Event::MouseWheel { unit, delta: step, phase, modifiers: latest, .. } => match phase {
                     TouchPhase::Start => {
                         self.touch = Some(*latest);
                         modifiers = *latest;
@@ -256,7 +272,7 @@ mod tests {
     use std::rc::Rc;
 
     fn wheel(unit: MouseWheelUnit, delta: Vec2, phase: TouchPhase, modifiers: Modifiers) -> Event {
-        Event::MouseWheel { unit, delta, phase, modifiers }
+        Event::MouseWheel { unit, delta, phase, modifiers, source: egui::MouseWheelSource::Unknown }
     }
 
     fn notch(dy: f32, modifiers: Modifiers) -> Event {
@@ -505,6 +521,28 @@ mod tests {
             let eguis = ctx.input(|i| i.zoom_delta());
             assert_eq!(zoom_delta(ctx), eguis);
         });
+    }
+
+    /// A multi-pass frame (a `Grid` sizing pass, `request_discard`) reads the wheel once: the
+    /// second, presented pass sees the same whole step, not a zero from its emptied input.
+    #[test]
+    fn a_discarded_pass_keeps_the_frames_whole_wheel_step() {
+        let ctx = egui::Context::default();
+        let mut motion = Motion { reduced: true, ..Default::default() };
+        let line = egui::InputOptions::default().line_scroll_speed;
+        let mut seen = Vec::new();
+        let raw = egui::RawInput { time: Some(0.1), events: vec![notch(-1.0, Modifiers::NONE)], ..Default::default() };
+        let output = ctx.run_ui(raw, |ui| {
+            motion.begin_pass(ui.ctx(), AnimationEffects::System);
+            seen.push(ui.ctx().input(|i| i.smooth_scroll_delta));
+            if ui.ctx().current_pass_index() == 0 {
+                ui.ctx().request_discard("motion multipass test");
+            }
+        });
+        output.drop_without_applying_deltas();
+        assert_eq!(seen.len(), 2, "the frame really ran two passes");
+        assert_eq!(seen[0], vec2(0.0, -line), "the first pass reads the notch");
+        assert_eq!(seen[1], seen[0], "the presented pass keeps it instead of wiping it");
     }
 
     #[test]

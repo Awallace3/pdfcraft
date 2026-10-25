@@ -73,17 +73,46 @@ fn harness_pages_at(pages: usize, width: f32, scale: f32) -> (Harness<'static, P
 /// Send a request and run frames until it is answered.
 fn call(h: &mut Harness<'static, PdfCraftApp>, c: &ControlClient, method: &str, params: Value) -> Reply {
     let rx = c.send(method, params);
-    for _ in 0..30 {
-        h.step();
-        if let Ok(r) = rx.try_recv() {
-            return r;
-        }
+    let mut reply = None;
+    let answered = crate::support::step_until(h, |_| {
+        reply = rx.try_recv().ok();
+        reply.is_some()
+    });
+    match reply {
+        Some(r) if answered => r,
+        _ => panic!("{method}: no reply in 30 s"),
     }
-    panic!("{method}: no reply after 30 frames");
 }
 
 fn ok(h: &mut Harness<'static, PdfCraftApp>, c: &ControlClient, method: &str, params: Value) -> Value {
     call(h, c, method, params).unwrap_or_else(|e| panic!("{method}: {e}"))
+}
+
+/// Let the next real frames run after a control setting that changes the interface fonts or
+/// opens a modal. `ui.set` answers in the input pass, and a font change discards the pass that
+/// applies it, so the modal's labels are not in the accessibility tree until those frames have
+/// been laid out.
+fn settle(h: &mut Harness<'static, PdfCraftApp>) {
+    h.run_steps(3);
+}
+
+#[test]
+fn comment_pin_is_reported_and_persistent() {
+    let (mut h, c) = harness();
+    assert_eq!(ok(&mut h, &c, "ui.state", json!({}))["comment_tool_pinned"], false);
+    for pinned in [true, false] {
+        ok(&mut h, &c, "ui.set", json!({"key":"comment-tool-pinned","value":pinned}));
+        assert_eq!(ok(&mut h, &c, "ui.state", json!({}))["comment_tool_pinned"], pinned);
+        let mut restored = PdfCraftApp::new();
+        restored.comment_prefs.pinned = !pinned;
+        restored.restore(&h.state().persist());
+        assert_eq!(restored.comment_prefs.pinned, pinned);
+        for invalid in [json!("yes"), json!(1), json!(null), json!([]), json!({})] {
+            assert!(call(&mut h, &c, "ui.set", json!({"key":"comment-tool-pinned","value":invalid})).is_err());
+            assert_eq!(ok(&mut h, &c, "ui.state", json!({}))["comment_tool_pinned"], pinned);
+        }
+        assert_eq!(ok(&mut h, &c, "ui.state", json!({}))["documents"][0]["dirty"], false);
+    }
 }
 
 #[test]
@@ -141,6 +170,9 @@ fn control_resize_reports_observed_dimensions_and_rejects_invalid_sizes() {
     assert_eq!(state["documents"][0]["dirty"], false);
 }
 
+/// Kittest calls only `App::logic` and `App::ui`, not eframe's `raw_input_hook`, so this checks
+/// the widget tree and key handling but not the production focus-generation ordering. The
+/// `production_*` tests above drive `prepare_raw_input` first and cover that ordering.
 #[test]
 fn control_focus_traverses_real_widgets_and_keyboard_activates() {
     let (mut h, c) = harness();
@@ -160,6 +192,55 @@ fn control_focus_traverses_real_widgets_and_keyboard_activates() {
     let state = ok(&mut h, &c, "ui.state", json!({}));
     assert_eq!(state["mode"], "Convert");
     assert_eq!(state["documents"][0]["dirty"], false);
+}
+
+/// A frame driven in production order: eframe's raw input hook runs before egui's input hooks, so
+/// the control plugin sees the focus/dialog generation produced by the previous UI pass. The
+/// kittest harness does not call `raw_input_hook`, which otherwise hides focus-change bugs.
+fn production_step(h: &mut Harness<'static, PdfCraftApp>) {
+    let ctx = h.ctx.clone();
+    let mut raw = std::mem::take(h.input_mut());
+    h.state_mut().prepare_raw_input(&ctx, &mut raw);
+    *h.input_mut() = raw;
+    h.step();
+}
+
+fn call_production(h: &mut Harness<'static, PdfCraftApp>, c: &ControlClient, method: &str, params: Value) -> Reply {
+    let rx = c.send(method, params);
+    for _ in 0..30 {
+        production_step(h);
+        if let Ok(r) = rx.try_recv() {
+            return r;
+        }
+    }
+    panic!("{method}: no reply after 30 production-ordered frames");
+}
+
+#[test]
+fn production_key_release_survives_the_focus_change_its_press_causes() {
+    let (mut h, c) = harness();
+    ok(&mut h, &c, "ui.focus", json!({"label": "Convert"}));
+    let reply = call_production(&mut h, &c, "ui.key", json!({"key": "Tab"}));
+    reply.unwrap_or_else(|e| panic!("a Tab press that moves focus must not leave its release unapplied: {e}"));
+    let sign = ok(&mut h, &c, "ui.inspect", json!({"query": "E-Sign", "role": "Button"}));
+    assert!(sign["widgets"].as_array().unwrap().iter().any(|w| w["label"] == "E-Sign" && w["focused"] == true), "focus moved on the press: {sign}");
+    assert!(!h.ctx.input(|i| i.keys_down.contains(&egui::Key::Tab)), "the release reached egui: no stuck Tab");
+}
+
+#[test]
+fn production_drag_releases_the_button_after_the_press_moves_focus() {
+    let (mut h, c) = harness_pages(2);
+    h.state_mut().apply_edit(pdfcraft_engine::Edit::AddBookmark { parent: vec![], index: 0, title: "Target".into(), page: 0, left: None, top: None });
+    ok(&mut h, &c, "ui.set", json!({"key": "panel", "value": "bookmarks"}));
+    let field = ok(&mut h, &c, "ui.inspect", json!({"query": "Search", "role": "TextInput"}));
+    let rect = field["widgets"][0]["rect"].as_array().expect("the search field has a rect");
+    let (x0, y0, x1, y1) = (rect[0].as_f64().unwrap(), rect[1].as_f64().unwrap(), rect[2].as_f64().unwrap(), rect[3].as_f64().unwrap());
+    let start = json!([x0 + 8.0, (y0 + y1) / 2.0]);
+    let end = json!([x1 - 8.0, (y0 + y1) / 2.0]);
+    call_production(&mut h, &c, "ui.drag", json!({"from": start, "to": end, "steps": 3}))
+        .unwrap_or_else(|e| panic!("the press's focus change must not cancel its moves and release: {e}"));
+    assert!(!h.ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary)), "the pointer button was released");
+    assert_eq!(h.ctx.input(|i| i.modifiers), egui::Modifiers::NONE, "no modifier is left held");
 }
 
 #[test]
@@ -188,7 +269,7 @@ fn control_text_focus_retains_text_undo_ownership() {
     ok(&mut h, &c, "ui.focus", json!({"id": widgets["widgets"][0]["id"]}));
     assert!(h.ctx.text_edit_focused());
     ok(&mut h, &c, "ui.type", json!({"text": "target"}));
-    let search_id = egui::Id::new(("bookmark_search", h.state().views[0].id.0));
+    let search_id = egui::Id::unique(("bookmark_search", h.state().views[0].id.0));
     assert_eq!(h.ctx.data(|d| d.get_temp::<String>(search_id)).as_deref(), Some("target"));
     ok(&mut h, &c, "ui.key", json!({"key": "Z", "modifiers": ["command"]}));
     assert_eq!(h.ctx.data(|d| d.get_temp::<String>(search_id)).as_deref(), Some(""));
@@ -252,6 +333,65 @@ fn control_quit_preserves_dirty_documents_and_cancel_keeps_them_open() {
     assert_eq!(state["documents"][0]["dirty"], true);
     assert_eq!(state["documents"][0]["pages"], 6);
     assert!(!close_requested(&h));
+}
+
+/// Run one frame and return the attention requests it sent to the window.
+fn step_attention(h: &mut Harness<'static, PdfCraftApp>) -> Vec<egui::UserAttentionType> {
+    h.step();
+    let commands = h.output().viewport_output.values().flat_map(|v| v.commands.iter());
+    commands.filter_map(|c| if let egui::ViewportCommand::RequestUserAttention(a) = c { Some(*a) } else { None }).collect()
+}
+
+/// Send a request, run frames until it is answered and three more, and collect every attention
+/// request those frames sent.
+fn attention_during(h: &mut Harness<'static, PdfCraftApp>, c: &ControlClient, method: &str, params: Value) -> Vec<egui::UserAttentionType> {
+    let rx = c.send(method, params);
+    let mut sent = Vec::new();
+    for _ in 0..30 {
+        sent.extend(step_attention(h));
+        if rx.try_recv().is_ok() {
+            (0..3).for_each(|_| sent.extend(step_attention(h)));
+            return sent;
+        }
+    }
+    panic!("{method}: no reply after 30 frames");
+}
+
+/// Open `name` with an unsaved change, in a tab of its own.
+fn open_unsaved(h: &mut Harness<'static, PdfCraftApp>, name: &str) {
+    let app = h.state_mut();
+    app.open_bytes(name, None, fixture(1)).unwrap();
+    app.active = Some(app.views.len() - 1);
+    app.apply_edit(pdfcraft_engine::Edit::RotatePages { pages: vec![0], degrees: 90 });
+}
+
+/// An agent quits while another app is in front, then answers the prompts itself. Quitting asks
+/// about each unsaved document in turn; the request made for the first question stands for the
+/// next, and answering the last withdraws it, so the taskbar or the window list stops flagging a
+/// window with nothing to ask. Each question is a new one: when the first opened in front, the
+/// next one asks when it opens in the background.
+#[test]
+fn a_save_prompt_answered_in_the_background_withdraws_its_attention_request() {
+    use egui::UserAttentionType::{Critical, Reset};
+    let (mut h, c) = harness();
+    ok(&mut h, &c, "ui.command", json!({"id": "page.insert_blank"}));
+    open_unsaved(&mut h, "second.pdf");
+    h.input_mut().focused = false;
+    assert_eq!(attention_during(&mut h, &c, "ui.quit", json!({})), [Critical]);
+    assert!(attention_during(&mut h, &c, "ui.click", json!({"label": "Don't save"})).is_empty(), "the request stands");
+    assert_eq!(attention_during(&mut h, &c, "ui.click", json!({"label": "Cancel"})), [Reset]);
+
+    open_unsaved(&mut h, "third.pdf");
+    h.input_mut().focused = true;
+    assert!(attention_during(&mut h, &c, "ui.quit", json!({})).is_empty(), "the first question opens in front");
+    h.input_mut().focused = false;
+    assert!(attention_during(&mut h, &c, "ui.state", json!({})).is_empty(), "leaving it open asks nothing");
+    assert_eq!(attention_during(&mut h, &c, "ui.click", json!({"label": "Don't save"})), [Critical], "the next opens in the background");
+    assert_eq!(attention_during(&mut h, &c, "ui.click", json!({"label": "Cancel"})), [Reset]);
+    let state = ok(&mut h, &c, "ui.state", json!({}));
+    assert_eq!(state["close_prompt"], false);
+    let left: Vec<_> = state["documents"].as_array().unwrap().iter().map(|d| (d["name"].clone(), d["dirty"].clone())).collect();
+    assert_eq!(left, [(json!("third.pdf"), json!(true))], "Don't save closed doc.pdf and second.pdf; Cancel kept third.pdf");
 }
 
 #[test]
@@ -374,7 +514,7 @@ fn language_switch_preserves_document_and_command_ids() {
         let lang = i18n::Lang::from_code(code).unwrap();
         h.get_by_label(i18n::tr(lang, "Menu")).click();
         h.run_steps(2);
-        h.get_by_label(&format!("{} ⏵", i18n::tr(lang, "File"))).hover();
+        h.get_by_label(i18n::tr(lang, "File")).hover();
         h.run_steps(3);
         h.get_by_label_contains(i18n::tr(lang, "Open…"));
         ok(&mut h, &c, "ui.key", json!({ "key": "Escape" }));
@@ -636,6 +776,7 @@ fn autoscroll_cancels_on_click_wheel_focus_loss_and_pointer_exit() {
         delta: egui::vec2(0.0, -20.0),
         phase: egui::TouchPhase::Move,
         modifiers: egui::Modifiers::NONE,
+        source: egui::MouseWheelSource::Unknown,
     });
     h.run_steps(2);
     assert!(!h.state().views[0].auto_scrolling());
@@ -774,6 +915,8 @@ fn japanese_controls_and_search_keep_command_ids() {
     assert_eq!(ok(&mut h, &c, "ui.state", json!({}))["mode"], "Convert");
 
     ok(&mut h, &c, "ui.command", json!({ "id": "app.preferences" }));
+    // The command sets the dialog; its content reaches the accessibility tree in the next pass.
+    h.run_steps(2);
     let prefs = ok(&mut h, &c, "ui.inspect", json!({ "query": "表示言語" }));
     assert!(prefs["count"].as_u64().unwrap() > 0, "{prefs}");
     ok(&mut h, &c, "ui.click", json!({ "label": "OK" }));
@@ -799,6 +942,7 @@ fn german_preferences_and_search_keep_command_ids() {
     ok(&mut h, &c, "ui.click", json!({ "label": "Konvertieren" }));
     assert_eq!(ok(&mut h, &c, "ui.state", json!({}))["mode"], "Convert");
     ok(&mut h, &c, "ui.command", json!({ "id": "app.preferences" }));
+    h.run_steps(2);
     let prefs = ok(&mut h, &c, "ui.inspect", json!({ "query": "Sprache der Oberfläche" }));
     assert!(prefs["count"].as_u64().unwrap() > 0, "{prefs}");
     let selector = ok(&mut h, &c, "ui.inspect", json!({ "query": "Deutsch" }));
@@ -828,6 +972,7 @@ fn ukrainian_preferences_and_search_keep_command_ids() {
     let (mut h, c) = harness();
     ok(&mut h, &c, "ui.set", json!({ "key": "language", "value": "uk" }));
     ok(&mut h, &c, "ui.command", json!({ "id": "app.preferences" }));
+    h.run_steps(2);
     for label in ["Мова інтерфейсу", "Українська"] {
         let found = ok(&mut h, &c, "ui.inspect", json!({ "query": label }));
         assert!(found["count"].as_u64().unwrap() > 0, "{label}: {found}");
@@ -860,7 +1005,14 @@ fn preferences_menu_and_shortcut_allow_switching_interface_languages() {
     let (mut h, c) = harness();
     ok(&mut h, &c, "ui.set", json!({ "key": "language", "value": "ja" }));
     ok(&mut h, &c, "ui.click", json!({ "label": "メニュー" }));
-    ok(&mut h, &c, "ui.click", json!({ "label": "編集 ⏵" }));
+    h.run_steps(2);
+    // The open menu's Edit entry and the left panel's Edit tool share the visible label. Pick
+    // the popup entry by its id, not by its visible text.
+    let edits = ok(&mut h, &c, "ui.inspect", json!({ "query": "編集", "role": "Button" }));
+    // The tool button reports its toggle state; the popup's menu button does not.
+    let edit = edits["widgets"].as_array().unwrap().iter().find(|w| w.get("toggled").is_none()).expect("the Edit menu entry");
+    ok(&mut h, &c, "ui.click", json!({ "id": edit["id"] }));
+    h.run_steps(2);
     let menu = ok(&mut h, &c, "ui.inspect", json!({ "query": "環境設定…" }));
     let prefs = menu["widgets"].as_array().unwrap().iter().find(|w| w["clickable"] == true).expect("Preferences menu item");
     ok(&mut h, &c, "ui.click", json!({ "id": prefs["id"] }));
@@ -935,7 +1087,9 @@ fn simplified_chinese_about_tabs_and_credit_controls() {
     let (mut h, c) = harness();
     let documents = ok(&mut h, &c, "ui.state", json!({}))["documents"].clone();
     ok(&mut h, &c, "ui.set", json!({"key": "language", "value": "zh-hans"}));
+    settle(&mut h);
     ok(&mut h, &c, "ui.set", json!({"key": "dialog", "value": "about"}));
+    settle(&mut h);
     for label in ["关于", "贡献者", "模型"] {
         let found = ok(&mut h, &c, "ui.inspect", json!({"query": label}));
         assert!(found["widgets"].as_array().unwrap().iter().any(|w| w["label"] == label), "{found}");
@@ -962,7 +1116,9 @@ fn simplified_chinese_signature_prompts_and_errors_keep_document_state() {
     let (mut h, c) = harness();
     let documents = ok(&mut h, &c, "ui.state", json!({}))["documents"].clone();
     ok(&mut h, &c, "ui.set", json!({"key": "language", "value": "zh-hans"}));
+    settle(&mut h);
     ok(&mut h, &c, "ui.set", json!({"key": "dialog", "value": "signature"}));
+    settle(&mut h);
     let typed = ok(&mut h, &c, "ui.inspect", json!({"query": "请输入您的签名。"}));
     assert!(typed["count"].as_u64().unwrap() > 0, "{typed}");
     // The shell also has a Draw control; the modal's button is registered after the shell.
@@ -1190,6 +1346,10 @@ fn screenshots_of_window_and_region() {
     let region = ok(&mut h, &c, "ui.screenshot", json!({ "region": [10, 20, 110, 70] }));
     assert_eq!((region["width"].as_f64().unwrap(), region["height"].as_f64().unwrap()), ((100.0 * ppp).round(), (50.0 * ppp).round()));
     assert!(call(&mut h, &c, "ui.screenshot", json!({ "region": [5, 5, 1, 1] })).is_err());
+    // A region that cannot be inside the window is refused at admission, before a frame or slot
+    // is used, with an actionable message.
+    let outside = call(&mut h, &c, "ui.screenshot", json!({ "region": [1300, 0, 1500, 10] })).unwrap_err();
+    assert!(outside.contains("inside the window"), "{outside}");
 }
 
 #[test]
@@ -1365,6 +1525,58 @@ fn a_1_to_50_scale_in_millimetres_measures_a_10_mm_line_as_500_mm() {
 }
 
 #[test]
+fn a_plan_scale_picked_or_typed_applies_at_once() {
+    use pdfcraft_engine::measure::{self, Kind};
+    let (mut h, c) = harness_pages(1);
+    let doc = h.state().views[0].id;
+    ok(&mut h, &c, "ui.command", json!({"id":"measure.scale"}));
+    h.run_steps(3);
+    h.state_mut().views[0].measure.unit = "m".into();
+    h.run_steps(2);
+    // 60 mm of paper.
+    let line = [[20.0, 20.0], [20.0 + 60.0 / 25.4 * 72.0, 20.0]];
+    let read = |h: &Harness<'static, PdfCraftApp>| {
+        let scale = h.state().session.get(doc).unwrap().measurement_scale(0, line[0]).unwrap();
+        (measure::reading(Kind::Distance, &line, &scale).unwrap().label, scale.ratio)
+    };
+    // Picked from the common scales: no Apply click.
+    h.get_by(|n| n.role() == egui::accesskit::Role::ComboBox && n.value().is_some_and(|v| v == "Common scales")).click();
+    h.run_steps(2);
+    h.get_by_label("1:200").click_accesskit();
+    h.run_steps(3);
+    assert_eq!(read(&h), ("12.00 m".to_string(), "1 mm = 0.2 m".to_string()));
+    // Typed, in the other notations; leaving the field applies.
+    fn field<'a>(h: &'a Harness<'static, PdfCraftApp>) -> egui_kittest::Node<'a> {
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Scale")
+    }
+    for (typed, label) in [("1/50", "3.00 m"), ("1:100", "6.00 m")] {
+        field(&h).click();
+        h.run_steps(1);
+        h.state_mut().views[0].measure.ratio_text.clear();
+        field(&h).type_text(typed);
+        h.run_steps(2);
+        h.key_press(egui::Key::Enter);
+        h.run_steps(3);
+        assert_eq!(read(&h).0, label, "{typed}");
+    }
+    // Nonsense is refused with a message and leaves the page scale alone.
+    let before = read(&h);
+    field(&h).click();
+    h.run_steps(1);
+    h.state_mut().views[0].measure.ratio_text.clear();
+    field(&h).type_text("1:0");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(read(&h), before);
+    assert!(h.state().views[0].measure.error.is_some());
+    // The scale is one undoable edit.
+    ok(&mut h, &c, "ui.command", json!({"id":"edit.undo"}));
+    h.run_steps(2);
+    assert_ne!(read(&h), before);
+}
+
+#[test]
 fn docking_pointer_group_float_close_restore_and_document_commands() {
     use pdfcraft_ui_egui::docking::Panel;
     let (mut h, c) = harness();
@@ -1484,6 +1696,22 @@ fn explicit_panel_requests_reveal_inactive_group_members() {
     h.run_steps(4);
     // The Edit panel's own row: the tool's name is on the floating toolbar too while it is on.
     h.get_by_label("Header and footer");
+}
+
+/// #3580 review: a panel a script opens (`app.execMenuItem("ShowHideBookmarks")`) is shown even
+/// when the inspector is a background tab of a custom docking layout.
+#[test]
+fn a_script_opened_panel_reveals_an_inactive_inspector() {
+    let (mut h, c) = harness();
+    ok(&mut h, &c, "ui.set", json!({"key":"panel", "value":"pages"}));
+    ok(&mut h, &c, "ui.dock", json!({"operation":"move", "panel":"inspector", "target":"tools", "zone":"center"}));
+    ok(&mut h, &c, "ui.dock", json!({"operation":"activate", "panel":"tools"}));
+    h.run_steps(3);
+    assert!(h.query_by_label("This document has no bookmarks.").is_none());
+    let id = h.state().active_ids().unwrap().1;
+    h.state_mut().run_button_script(id, "", "app.execMenuItem('ShowHideBookmarks')");
+    h.run_steps(4);
+    h.get_by_label("This document has no bookmarks.");
 }
 
 #[test]
@@ -1672,17 +1900,16 @@ fn control_open_replies_pending_while_the_worker_opens_and_focuses_once_it_has()
     assert_eq!(first["pending"], true, "{first}");
 
     // The worker completes the open on later frames; the tab shows, and only then does a
-    // repeated open focus it instead of reporting another pending open.
+    // repeated open focus it instead of reporting another pending open. The worker is a thread
+    // of its own, so the wait is bounded by time: a busy runner can draw 30 frames before it has
+    // read the file.
     let mut documents = 0;
-    for _ in 0..30 {
-        h.run_steps(1);
-        let state = ok(&mut h, &c, "ui.state", json!({}));
+    let opened = crate::support::step_until(&mut h, |h| {
+        let state = ok(h, &c, "ui.state", json!({}));
         documents = state["documents"].as_array().map(|d| d.len()).unwrap_or_default();
-        if documents == 1 {
-            break;
-        }
-    }
-    assert_eq!(documents, 1, "the pending open completed into a tab");
+        documents == 1
+    });
+    assert!(opened, "the pending open completed into a tab: {documents} tabs");
 
     let again = ok(&mut h, &c, "ui.open", json!({ "path": a }));
     assert_eq!(again["focused"], true, "{again}");
@@ -1704,7 +1931,13 @@ fn navigation_wheel(h: &mut Harness<'static, PdfCraftApp>, pos: egui::Pos2, delt
         vec![
             egui::Event::ModifiersChanged(modifiers),
             egui::Event::PointerMoved(pos),
-            egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, delta), modifiers, phase: egui::TouchPhase::Move },
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, delta),
+                modifiers,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+            },
         ],
     );
     h.run_steps(20);
@@ -1804,7 +2037,7 @@ fn page_size_shows_while_the_pointer_is_in_the_bottom_left_quadrant() {
     let (mut h, _c) = harness();
     let area = h.state().views[0].viewport_rect();
     let shown = |h: &Harness<'static, PdfCraftApp>| {
-        let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("page-size-hint"));
+        let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("page-size-hint"));
         h.ctx.memory(|m| m.areas().visible_last_frame(&layer))
     };
     let away = area.center() + egui::vec2(300.0, -200.0);
@@ -1885,6 +2118,7 @@ fn routine_continuous_scrolling_does_not_add_navigation_history() {
         delta: egui::vec2(0.0, -1200.0),
         modifiers: egui::Modifiers::NONE,
         phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Unknown,
     });
     h.run_steps(8);
     assert!(h.state().views[0].current > 0, "the wheel really moved to a later page");

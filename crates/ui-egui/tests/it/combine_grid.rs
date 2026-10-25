@@ -180,6 +180,17 @@ fn ready(t: &CombineThumb) -> bool {
     matches!(t, CombineThumb::Ready { .. })
 }
 
+/// Wait for a modal opened by an action to be laid out and present in the accessibility tree.
+/// A newly shown modal needs a pass of its own; the action's frame only sets its state.
+fn wait_for_label(h: &mut Harness<'static, PdfCraftApp>, label: &str) {
+    for _ in 0..30 {
+        if h.query_by_label(label).is_some() {
+            return;
+        }
+        h.run_steps(1);
+    }
+}
+
 /// Press, move in steps and release, as a user drags.
 fn drag(h: &mut Harness<'static, PdfCraftApp>, from: Pos2, to: Pos2) {
     h.hover_at(from);
@@ -699,6 +710,7 @@ fn a_locked_card_offers_unlock_on_a_right_click() {
     // The menu's item comes after the toolbar's button of the same name.
     h.get_all_by_label("Unlock…").last().unwrap().click();
     h.run_steps(2);
+    wait_for_label(&mut h, "Unlock secret.pdf");
     h.get_by_label("Unlock secret.pdf");
     assert_eq!(h.state().combine_selection(), [1], "the card right-clicked is the one unlocked");
 }
@@ -716,6 +728,7 @@ fn ctrl_wheel(h: &mut Harness<'static, PdfCraftApp>, at: Pos2, dy: f32) {
         delta: vec2(0.0, dy),
         phase: egui::TouchPhase::Move,
         modifiers: Modifiers::COMMAND,
+        source: egui::MouseWheelSource::Unknown,
     });
     h.run_steps(3);
 }
@@ -845,6 +858,7 @@ fn zooming_keeps_the_card_under_the_pointer_in_place_and_thumbnails_never_go_bla
         delta: vec2(0.0, -300.0),
         phase: egui::TouchPhase::Move,
         modifiers: Modifiers::NONE,
+        source: egui::MouseWheelSource::Unknown,
     });
     h.run_steps(6);
     // A card fully in view, below the toolbar, with its thumbnail drawn.
@@ -866,6 +880,7 @@ fn zooming_keeps_the_card_under_the_pointer_in_place_and_thumbnails_never_go_bla
         delta: vec2(0.0, 120.0),
         phase: egui::TouchPhase::Move,
         modifiers: Modifiers::COMMAND,
+        source: egui::MouseWheelSource::Unknown,
     });
     // The wheel zooms smoothly over several frames; in every one the card stays put.
     let mut zooms = Vec::new();
@@ -976,6 +991,7 @@ fn scrolled_grid(dy: f32) -> (Harness<'static, PdfCraftApp>, f32) {
         delta: vec2(0.0, -dy),
         phase: egui::TouchPhase::Move,
         modifiers: Modifiers::NONE,
+        source: egui::MouseWheelSource::Unknown,
     });
     h.run_steps(8);
     (h, top)
@@ -1024,6 +1040,7 @@ fn zooming_out_at_the_bottom_leaves_no_gap_below_the_last_card() {
         delta: vec2(0.0, -20_000.0),
         phase: egui::TouchPhase::Move,
         modifiers: Modifiers::NONE,
+        source: egui::MouseWheelSource::Unknown,
     });
     h.run_steps(8);
     let bottom = card(&h, "f39.pdf").bottom();
@@ -1598,13 +1615,16 @@ fn a_page_cards_magnifier_opens_the_preview_on_that_page() {
     h.get_by_label("Preview").click();
     h.run_steps(2);
     assert_eq!(h.state().combine_preview().map(|p| (p.0, p.1)), Some(("b.pdf".to_string(), 3)));
+    wait_for_label(&mut h, "Page 3 of 3");
     h.get_by_label("Page 3 of 3");
-    // A page card's own actions: Collapse, Remove page, Preview (its file can't be removed from
-    // it); nothing is selected yet, so no "Remove b.pdf" anywhere.
-    h.get_by_label("Remove page");
+    // The preview is modal: the card's actions are not drawn behind it.
+    assert!(h.query_by_label("Remove page").is_none(), "the preview covers the page card's actions");
     h.key_press(Key::Escape);
     h.run_steps(2);
+    // A page card's own actions: Collapse, Remove page, Preview (its file can't be removed from
+    // it); nothing is selected yet, so no "Remove b.pdf" anywhere.
     hover_card(&mut h, &page_card(4, "b.pdf"));
+    h.get_by_label("Remove page");
     h.get_by_label("Collapse");
     assert!(h.query_by_label("Remove b.pdf").is_none());
     // Space on a page card that has the keyboard: that page too.
@@ -1615,6 +1635,7 @@ fn a_page_cards_magnifier_opens_the_preview_on_that_page() {
     h.key_press(Key::Space);
     h.run_steps(2);
     assert_eq!(h.state().combine_preview().map(|p| p.1), Some(0), "page 1, the second the file adds");
+    wait_for_label(&mut h, "Page 2 of 3");
     h.get_by_label("Page 2 of 3");
 }
 
@@ -1651,6 +1672,7 @@ fn collapsing_brings_the_files_card_into_view() {
             delta: vec2(0.0, -120.0),
             phase: egui::TouchPhase::Move,
             modifiers: Modifiers::NONE,
+            source: egui::MouseWheelSource::Unknown,
         });
         h.run_steps(3);
     }

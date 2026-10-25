@@ -36,6 +36,8 @@
 //!   for this session without changing the saved preference. `ui.state.default_mode` reports it.
 //!   `theme=light|dark|system` changes the saved theme preference; `ui.state.theme_preference`
 //!   reports the choice and `ui.state.theme` reports the resolved light/dark colours.
+//!   `comment-tool-pinned=true|false` remembers the annotation quick bar's pin across restarts;
+//!   `ui.state.comment_tool_pinned` reports the same preference.
 //! - `ui.open {path}`: open a file. A file whose tab is already open focuses it
 //!   (`"focused": true`) instead of adding a tab; native opens report `pending: true` until
 //!   they complete and are listed in `ui.state.pending_opens`; only a failed open replies `Err`.
@@ -51,21 +53,13 @@ use serde_json::{Value, json};
 pub type Reply = Result<Value, String>;
 
 /// Seconds to wait for frames (input to be handled, a screenshot to be taken) before reporting
-/// that the window is not being drawn. While a window is hidden, minimized or fully covered,
-/// eframe keeps calling `logic` but runs no egui pass, so input and screenshots wait.
+/// that the window is not being drawn. `App::logic` also runs while a window is hidden,
+/// minimized or fully covered, where egui's own input clock does not advance; every deadline
+/// here uses a monotonic `web_time::Instant` so hidden logic cannot stall or restart it.
 const NOT_DRAWN_TIMEOUT: f64 = 5.0;
 
-/// Wall-clock seconds (egui's own clock stops while the window is not drawn).
-fn now_secs() -> f64 {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-        START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        js_sys::Date::now() / 1000.0
-    }
+fn timeout() -> std::time::Duration {
+    std::time::Duration::from_secs_f64(NOT_DRAWN_TIMEOUT)
 }
 
 fn not_drawn(what: &str) -> String {
@@ -107,11 +101,98 @@ struct Shared {
     nodes: HashMap<NodeId, accesskit::Node>,
     root: Option<NodeId>,
     focus: Option<NodeId>,
-    /// Event batches to inject, one batch per frame.
-    inject: VecDeque<Vec<egui::Event>>,
-    /// Real egui passes so far (counted in `output_hook`, which `logic`-only calls never reach).
+    /// Queued synthetic-input requests, each with one event batch per UI pass.
+    inject: VecDeque<RequestBatches>,
+    /// Accepted (not discarded) egui passes, counted in `output_hook`.
     passes: u64,
+    /// The document/focus generation the app last admitted input for.
+    epoch: u64,
+    /// Input requests whose queued events became stale before a UI pass consumed them.
+    dropped: Vec<u64>,
+    next_batch: u64,
+    /// A batch admitted before its deadline may finish this pass. Expiry runs before the next
+    /// input hook (or in hidden logic), never after egui has already calculated its interaction.
+    in_pass: bool,
+    expired: Vec<u64>,
+    cleanup: Vec<egui::Event>,
+    cancel_pointer: bool,
+    cancel_gestures: bool,
 }
+
+/// One queued synthetic-input request: its batches are injected one per UI pass.
+struct RequestBatches {
+    request: u64,
+    /// The document/dialog/focus generation the request was admitted for.
+    epoch: u64,
+    /// The first batch was injected, so a focus/dialog change does not reject its own remaining
+    /// batches. The admission deadline still cancels a partially delivered gesture.
+    started: bool,
+    since: web_time::Instant,
+    /// Inverse presses still held by this request. Pointer entries are ownership markers for
+    /// cancellation only: replaying one on timeout would click or drop the abandoned gesture.
+    release: Vec<egui::Event>,
+    batches: VecDeque<Vec<egui::Event>>,
+}
+
+/// Track only presses that reached egui and have not yet been released. A pointer release is
+/// retained as an ownership marker, never as a timeout event.
+fn note_pressed(release: &mut Vec<egui::Event>, events: &[egui::Event]) {
+    for event in events {
+        match event {
+            egui::Event::Key { key, pressed: true, .. }
+                if !release.iter().any(|event| matches!(event, egui::Event::Key { key: seen, pressed: false, .. } if seen == key)) =>
+            {
+                release.push(egui::Event::Key { key: *key, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE });
+            }
+            egui::Event::PointerButton { pos, button, pressed: true, .. }
+                if !release
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::PointerButton { button: seen, pressed: false, .. } if seen == button)) =>
+            {
+                release.push(egui::Event::PointerButton { pos: *pos, button: *button, pressed: false, modifiers: egui::Modifiers::NONE });
+            }
+            egui::Event::ModifiersChanged(modifiers)
+                if *modifiers != egui::Modifiers::NONE && !release.contains(&egui::Event::ModifiersChanged(egui::Modifiers::NONE)) =>
+            {
+                release.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+            }
+            egui::Event::Key { key, pressed: false, .. } => {
+                release.retain(|event| !matches!(event, egui::Event::Key { key: seen, .. } if seen == key));
+            }
+            egui::Event::PointerButton { button, pressed: false, .. } => {
+                release.retain(|event| !matches!(event, egui::Event::PointerButton { button: seen, .. } if seen == button));
+            }
+            egui::Event::ModifiersChanged(modifiers) if *modifiers == egui::Modifiers::NONE => {
+                release.retain(|event| !matches!(event, egui::Event::ModifiersChanged(_)));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Cancel expired requests before egui computes interaction. Hidden logic calls this too, so
+/// replies do not wait for a visible frame. Never complete an abandoned pointer gesture.
+fn expire_input(shared: &mut Shared, now: web_time::Instant) {
+    shared.inject.retain_mut(|request| {
+        if now.duration_since(request.since) <= timeout() {
+            return true;
+        }
+        shared.expired.push(request.request);
+        for event in request.release.drain(..) {
+            if matches!(event, egui::Event::PointerButton { .. }) {
+                shared.cancel_pointer = true;
+                shared.cancel_gestures = true;
+            } else {
+                shared.cleanup.push(event);
+            }
+        }
+        false
+    });
+}
+
+/// Synthetic input is bounded like screenshots: a local authenticated client must not be able to
+/// queue unbounded batches (one frame each) and hold the control channel's memory for ever.
+const MAX_QUEUED_BATCHES: usize = 512;
 
 /// The egui plugin half of the control channel.
 pub struct ControlPlugin {
@@ -125,17 +206,65 @@ impl egui::Plugin for ControlPlugin {
 
     fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
         let Ok(mut s) = self.shared.lock() else { return };
-        if let Some(batch) = s.inject.pop_front() {
-            input.events.extend(batch);
+        expire_input(&mut s, web_time::Instant::now());
+        if std::mem::take(&mut s.cancel_pointer) {
+            // input_hook precedes Context::begin_pass. stop_dragging sets the OLD snapshot's
+            // drag_stopped; begin_pass replaces that snapshot without a release/click/drop.
+            ctx.input_mut(|i| i.pointer = Default::default());
+            ctx.stop_dragging();
+            egui::DragAndDrop::clear_payload(ctx);
+        }
+        input.events.append(&mut s.cleanup);
+        s.in_pass = true;
+        let epoch = s.epoch;
+        let Some(front) = s.inject.front_mut() else { return };
+        if !front.started {
+            if front.epoch != epoch {
+                // The document, dialog or focus changed after this request was admitted, before
+                // any of its input landed. Drop only this request; later requests are unrelated.
+                let request = front.request;
+                s.inject.pop_front();
+                s.dropped.push(request);
+                if !s.inject.is_empty() {
+                    ctx.request_repaint();
+                }
+                return;
+            }
+            front.started = true;
+        }
+        // A non-expired request's own earlier batch may have changed focus or opened a dialog.
+        // Let it finish normally; expiry above cancels held pointer state instead of completing
+        // an abandoned click/drop.
+        let events = front.batches.pop_front();
+        if let Some(events) = &events {
+            // Remember the inverse of what this request presses as it is applied, so a timeout
+            // after this batch can still release exactly those inputs.
+            note_pressed(&mut front.release, events);
+        }
+        let done = front.batches.is_empty();
+        if done {
+            s.inject.pop_front();
+        }
+        if let Some(events) = events {
+            input.events.extend(events);
         }
         if !s.inject.is_empty() {
             ctx.request_repaint();
         }
     }
 
-    fn output_hook(&mut self, _ctx: &egui::Context, output: &mut egui::FullOutput) {
+    fn output_hook(&mut self, ctx: &egui::Context, output: &mut egui::FullOutput) {
         let Ok(mut s) = self.shared.lock() else { return };
-        s.passes += 1;
+        s.in_pass = false;
+        // A discarded pass is layout work, not a frame the agent can observe. Only count passes
+        // whose output is actually presented, so a request cannot be answered early. The last
+        // pass of a frame is presented even when its own discard request was refused because
+        // `max_passes` is reached; egui still reports that request in the output.
+        let max_passes = ctx.options(|o| o.max_passes.get());
+        let final_pass = output.platform_output.num_completed_passes >= max_passes;
+        if output.platform_output.request_discard_reasons.is_empty() || final_pass {
+            s.passes += 1;
+        }
         let Some(update) = &output.platform_output.accesskit_update else { return };
         s.nodes = update.nodes.iter().cloned().collect();
         s.root = update.tree.as_ref().map(|t| t.root);
@@ -143,21 +272,105 @@ impl egui::Plugin for ControlPlugin {
     }
 }
 
+/// Screenshot admission limits: bounded requests, per-image bytes and aggregate retained bytes.
+const MAX_PENDING_SCREENSHOTS: usize = 4;
+const MAX_IMAGE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+/// One image's encode working copies are bounded too: the RGBA buffer fed to the PNG encoder,
+/// the encoded PNG, and the base64 string in the reply. They are made one capture at a time,
+/// after the retained image budget above has been checked. Peak encoding memory is therefore at
+/// most the retained aggregate plus one crop, one PNG and one base64 string; it is not hidden
+/// behind the retained-image limit.
+const MAX_ENCODED_BYTES: usize = MAX_IMAGE_BYTES;
+const MAX_BASE64_BYTES: usize = 192 * 1024 * 1024;
+
+/// Replace one pending capture's reservation with `bytes`, keeping the other reservations.
+///
+/// The drain retries captures one at a time: using a single total taken before the loop would
+/// let several retries each see room that no longer exists together, and the aggregate would
+/// grow past [`MAX_TOTAL_BYTES`].
+fn retried_reservation(total: usize, old: usize, bytes: usize) -> Option<usize> {
+    let without_this = total.saturating_sub(old);
+    let new_total = without_this.saturating_add(bytes);
+    (bytes <= MAX_IMAGE_BYTES && new_total <= MAX_TOTAL_BYTES).then_some(new_total)
+}
+
+/// The window content a screenshot request was admitted and issued for.
+///
+/// Only the viewport's local size and scale matter: the window's position on the monitor does not
+/// change a single captured pixel, and keyboard focus is not part of the captured content.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Geometry {
+    size: egui::Vec2,
+    pixels_per_point: f32,
+    /// Active document and open dialog/prompt identity, never the focused widget.
+    epoch: u64,
+}
+
+impl Geometry {
+    fn current(ctx: &egui::Context, epoch: u64) -> Self {
+        // Viewport info is refreshed by `run_logic`; the last UI pass's `viewport_rect` can be
+        // stale while the window is hidden. Fall back to it only when the host cannot say. Only
+        // its size is kept: `inner_rect` is in monitor space and its origin may move.
+        let (rect, native) = ctx.input(|i| {
+            let viewport = i.viewport();
+            (viewport.inner_rect.unwrap_or_else(|| i.viewport_rect()), viewport.native_pixels_per_point)
+        });
+        let native = native.or_else(|| ctx.native_pixels_per_point()).unwrap_or(1.0);
+        Self { size: rect.size(), pixels_per_point: native * ctx.zoom_factor(), epoch }
+    }
+
+    /// Checked bytes an image of this geometry needs, before the capture is issued.
+    fn image_bytes(self) -> Option<usize> {
+        let width = (self.size.x * self.pixels_per_point).ceil();
+        let height = (self.size.y * self.pixels_per_point).ceil();
+        if !(width.is_finite() && height.is_finite()) || width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        checked_image_bytes(width as usize, height as usize)
+    }
+
+    /// Whether `region` is a non-empty rectangle inside this viewport, in logical points.
+    fn contains_region(self, region: egui::Rect) -> bool {
+        region.min.x.is_finite()
+            && region.min.y.is_finite()
+            && region.max.x.is_finite()
+            && region.max.y.is_finite()
+            && region.min.x >= 0.0
+            && region.min.y >= 0.0
+            && region.max.x > region.min.x
+            && region.max.y > region.min.y
+            && region.max.x <= self.size.x
+            && region.max.y <= self.size.y
+    }
+}
+
+fn checked_image_bytes(width: usize, height: usize) -> Option<usize> {
+    width.checked_mul(height)?.checked_mul(core::mem::size_of::<egui::Color32>())
+}
+
 enum Pending {
-    /// Answer after `frames` more frames (the injected input has been handled by then).
+    /// Answer after `frames` more accepted frames (the injected input has been handled by then).
     Frames {
-        /// Answer once this many egui passes have run (the injected input has been handled).
+        /// Answer once this many accepted UI passes have run.
         until_pass: u64,
-        since: f64,
+        /// The queued batches this request depends on; a stale one fails the request.
+        batches: Vec<u64>,
+        since: web_time::Instant,
         reply: Sender<Reply>,
         value: Value,
     },
     Screenshot {
-        tag: u64,
+        slot: craft_ui::capture::CaptureSlot,
+        /// The one-shot callback, kept until the settled pass that issues it.
+        callback: Option<egui::ScreenshotCallback>,
         region: Option<egui::Rect>,
         reply: Sender<Reply>,
-        /// When it was requested (egui time, seconds).
-        since: f64,
+        since: web_time::Instant,
+        geometry: Geometry,
+        /// Bytes reserved in the aggregate budget for this request.
+        reserved: usize,
+        attempts: u8,
     },
 }
 
@@ -166,7 +379,8 @@ pub struct Control {
     rx: Receiver<ControlRequest>,
     shared: Arc<Mutex<Shared>>,
     pending: Vec<Pending>,
-    next_tag: u64,
+    /// Requests admitted while the app cannot yet run a real UI pass (fonts not ready).
+    deferred: VecDeque<ControlRequest>,
 }
 
 /// Install the control channel on `ctx`: returns the app half and a client.
@@ -175,7 +389,7 @@ pub fn attach(ctx: &egui::Context) -> (Control, ControlClient) {
     ctx.add_plugin(ControlPlugin { shared: shared.clone() });
     ctx.enable_accesskit();
     let (tx, rx) = channel();
-    (Control { rx, shared, pending: Vec::new(), next_tag: 1 }, ControlClient { tx, ctx: ctx.clone() })
+    (Control { rx, shared, pending: Vec::new(), deferred: VecDeque::new() }, ControlClient { tx, ctx: ctx.clone() })
 }
 
 /// What a request needs from the app (implemented by `PdfCraftApp`).
@@ -187,75 +401,326 @@ pub(crate) trait Host {
     fn set(&mut self, key: &str, value: &str) -> Reply;
     fn open(&mut self, path: &str) -> Reply;
     fn quit(&mut self, ctx: &egui::Context) -> bool;
+
+    /// A generation that changes when the input target (document, dialog, focus) does.
+    ///
+    /// Synthetic input admitted for one generation must not be replayed into another.
+    fn input_epoch(&self) -> u64 {
+        0
+    }
+
+    /// A generation for the captured content (document and dialog identity only).
+    ///
+    /// Screenshots do not depend on keyboard focus, so a field gaining focus must not discard a
+    /// pending capture. Hosts that do not distinguish the two reuse the input generation.
+    fn capture_epoch(&self) -> u64 {
+        self.input_epoch()
+    }
+
+    /// Whether the app can apply a real UI pass yet (fonts installed, no early return).
+    fn accepts_input(&self) -> bool {
+        true
+    }
+
+    /// Drop transient app-owned grabs before widgets observe the canceled pointer as up.
+    fn cancel_pointer_gestures(&mut self) {}
 }
 
 impl Control {
-    /// Handle new requests and finish waiting ones. Call at the start of every frame.
+    /// Handle new requests and finish waiting ones. Call at the start of every frame (`logic`).
     pub(crate) fn tick(&mut self, ctx: &egui::Context, host: &mut impl Host) {
-        self.finish_pending(ctx);
+        self.set_epoch(host.input_epoch());
+        self.finish_pending(ctx, host);
+        let ready = host.accepts_input();
         while let Ok(req) = self.rx.try_recv() {
-            match self.handle(ctx, host, &req.method, &req.params) {
-                Handled::Now(r) => {
-                    let _ = req.reply.send(r);
+            if !ready {
+                if self.deferred.len() < 32 {
+                    self.deferred.push_back(req);
+                } else {
+                    let _ = req.reply.send(Err("the app is still starting; too many control requests queued".into()));
                 }
-                Handled::AfterFrames(frames, value) => {
-                    let until_pass = self.passes() + u64::from(frames);
-                    self.pending.push(Pending::Frames { until_pass, since: now_secs(), reply: req.reply, value });
-                }
-                Handled::Screenshot(region) => {
-                    let tag = self.next_tag;
-                    self.next_tag += 1;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(tag)));
-                    self.pending.push(Pending::Screenshot { tag, region, reply: req.reply, since: now_secs() });
-                }
+                continue;
+            }
+            self.dispatch(ctx, host, req);
+        }
+        if ready {
+            while let Some(req) = self.deferred.pop_front() {
+                self.dispatch(ctx, host, req);
             }
         }
-        if !self.pending.is_empty() {
+        if !self.pending.is_empty() || !self.deferred.is_empty() {
             ctx.request_repaint();
+            // A hidden or occluded window runs `logic` without a UI pass. Ask for one so queued
+            // input and screenshots can be applied; the screenshot command itself also paints.
+            //
+            // The shared fork's web host does not implement `RequestPaintWhileHidden` yet: a
+            // hidden browser tab still times out rather than falsely succeeding. Recorded as a
+            // pending fork prerequisite, not qualified here.
+            #[cfg(not(target_arch = "wasm32"))]
+            if ctx.input(|i| i.viewport().visible()) != Some(true) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+            }
         }
     }
 
-    fn finish_pending(&mut self, ctx: &egui::Context) {
-        let shots: Vec<(u64, Arc<egui::ColorImage>)> = ctx.input(|i| {
-            i.raw
-                .events
-                .iter()
-                .filter_map(|e| match e {
-                    egui::Event::Screenshot { user_data, image, .. } => {
-                        user_data.data.as_ref().and_then(|d| d.downcast_ref::<u64>()).map(|tag| (*tag, image.clone()))
+    /// Refresh the input-target generation before a pass consumes queued synthetic input.
+    ///
+    /// `raw_input_hook` runs before the plugin's `input_hook`, so a dialog opened by the
+    /// previous pass already invalidates a request that has not started yet, instead of a pass
+    /// later. Only that request is rejected; requests already started finish their batches.
+    pub(crate) fn set_epoch(&self, epoch: u64) {
+        if let Ok(mut s) = self.shared.lock() {
+            s.epoch = epoch;
+        }
+    }
+
+    /// Issue admitted captures after a settled UI pass. Call at the end of `App::ui`.
+    pub(crate) fn finish_frame(&mut self, ctx: &egui::Context, host: &mut impl Host) {
+        if !host.accepts_input() || ctx.will_discard() {
+            return;
+        }
+        let current = Geometry::current(ctx, host.capture_epoch());
+        let mut reserved_total = self.reserved_bytes();
+        let mut kept = Vec::new();
+        for pending in self.pending.drain(..) {
+            let mut entry = pending;
+            if let Pending::Screenshot { slot, callback, reply, region, geometry, reserved, attempts, since } = &mut entry
+                && callback.is_some()
+            {
+                if web_time::Instant::now().duration_since(*since) > timeout() {
+                    slot.cancel();
+                    reserved_total = reserved_total.saturating_sub(*reserved);
+                    let _ = reply.send(Err(not_drawn("the screenshot")));
+                    continue;
+                }
+                if geometry.epoch != current.epoch {
+                    slot.cancel();
+                    reserved_total = reserved_total.saturating_sub(*reserved);
+                    let _ = reply.send(Err("the document or dialog changed before the screenshot could be issued; it was not saved".into()));
+                    continue;
+                }
+                if *geometry != current {
+                    // Resize, DPI or zoom between admission and issuance: retry once with the
+                    // real geometry rather than cropping with stale numbers.
+                    if *attempts >= 1 {
+                        slot.cancel();
+                        reserved_total = reserved_total.saturating_sub(*reserved);
+                        let _ = reply.send(Err("the window geometry changed while the screenshot was being prepared; it was not saved".into()));
+                        continue;
                     }
-                    _ => None,
-                })
-                .collect()
+                    if region.as_ref().is_some_and(|region| !current.contains_region(*region)) {
+                        slot.cancel();
+                        reserved_total = reserved_total.saturating_sub(*reserved);
+                        let _ = reply.send(Err("the region must lie inside the window".into()));
+                        continue;
+                    }
+                    let Some(bytes) = current.image_bytes() else {
+                        slot.cancel();
+                        reserved_total = reserved_total.saturating_sub(*reserved);
+                        let _ = reply.send(Err("the window has no capturable size".into()));
+                        continue;
+                    };
+                    let Some(new_total) = retried_reservation(reserved_total, *reserved, bytes) else {
+                        slot.cancel();
+                        reserved_total = reserved_total.saturating_sub(*reserved);
+                        let _ = reply.send(Err("the screenshot no longer fits the screenshot budget".into()));
+                        continue;
+                    };
+                    reserved_total = new_total;
+                    slot.cancel();
+                    let (new_slot, new_callback) = craft_ui::capture::CaptureSlot::new(ctx, egui::ViewportId::ROOT, MAX_IMAGE_BYTES);
+                    *slot = new_slot;
+                    *callback = Some(new_callback);
+                    *geometry = current;
+                    *reserved = bytes;
+                    *attempts += 1;
+                }
+                if let Some(callback) = callback.take() {
+                    // The screenshot command itself requests a paint, including while hidden.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(callback));
+                }
+            }
+            kept.push(entry);
+        }
+        self.pending = kept;
+        if !self.pending.is_empty() {
+            #[cfg(not(target_arch = "wasm32"))]
+            if ctx.input(|i| i.viewport().visible()) != Some(true) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+            }
+        }
+    }
+
+    fn dispatch(&mut self, ctx: &egui::Context, host: &mut impl Host, req: ControlRequest) {
+        match self.handle(ctx, host, &req.method, &req.params) {
+            Handled::Now(r) => {
+                let _ = req.reply.send(r);
+            }
+            Handled::AfterFrames(frames, value) => {
+                let until_pass = self.passes() + u64::from(frames);
+                self.pending.push(Pending::Frames { until_pass, batches: Vec::new(), since: web_time::Instant::now(), reply: req.reply, value });
+            }
+            Handled::AfterInput { batches, frames, value } => {
+                let until_pass = self.passes() + u64::from(frames) + 1;
+                self.pending.push(Pending::Frames { until_pass, batches, since: web_time::Instant::now(), reply: req.reply, value });
+            }
+            Handled::Screenshot(region) => self.admit_screenshot(ctx, host, region, req.reply),
+        }
+    }
+
+    fn reserved_bytes(&self) -> usize {
+        self.pending
+            .iter()
+            .filter_map(|p| if let Pending::Screenshot { reserved, .. } = p { Some(*reserved) } else { None })
+            .fold(0usize, |sum, bytes| sum.saturating_add(bytes))
+    }
+
+    fn pending_screenshots(&self) -> usize {
+        self.pending.iter().filter(|p| matches!(p, Pending::Screenshot { .. })).count()
+    }
+
+    /// Admit one screenshot request within the count, per-image and aggregate limits.
+    fn admit_screenshot(&mut self, ctx: &egui::Context, host: &mut impl Host, region: Option<egui::Rect>, reply: Sender<Reply>) {
+        if self.pending_screenshots() >= MAX_PENDING_SCREENSHOTS {
+            let _ = reply.send(Err(format!("too many screenshots are already pending (limit {MAX_PENDING_SCREENSHOTS})")));
+            return;
+        }
+        let geometry = Geometry::current(ctx, host.capture_epoch());
+        let Some(bytes) = geometry.image_bytes() else {
+            let _ = reply.send(Err("the window has no capturable size".into()));
+            return;
+        };
+        if let Some(region) = region
+            && !geometry.contains_region(region)
+        {
+            let _ = reply.send(Err("the region must lie inside the window".into()));
+            return;
+        }
+        if bytes > MAX_IMAGE_BYTES {
+            let _ = reply.send(Err(format!("the screenshot would use {bytes} bytes, over the {MAX_IMAGE_BYTES}-byte image limit")));
+            return;
+        }
+        if self.reserved_bytes().saturating_add(bytes) > MAX_TOTAL_BYTES {
+            let _ = reply.send(Err(format!("the screenshot would exceed the {MAX_TOTAL_BYTES}-byte aggregate screenshot budget")));
+            return;
+        }
+        let (slot, callback) = craft_ui::capture::CaptureSlot::new(ctx, egui::ViewportId::ROOT, MAX_IMAGE_BYTES);
+        self.pending.push(Pending::Screenshot {
+            slot,
+            callback: Some(callback),
+            region,
+            reply,
+            since: web_time::Instant::now(),
+            geometry,
+            reserved: bytes,
+            attempts: 0,
         });
-        let ppp = ctx.pixels_per_point();
-        let now = now_secs();
+    }
+
+    fn finish_pending(&mut self, ctx: &egui::Context, host: &mut impl Host) {
+        let now = web_time::Instant::now();
+        let (dropped, expired, in_pass) = self
+            .shared
+            .lock()
+            .map(|mut s| {
+                if !s.in_pass {
+                    expire_input(&mut s, now);
+                }
+                if std::mem::take(&mut s.cancel_gestures) {
+                    host.cancel_pointer_gestures();
+                }
+                (std::mem::take(&mut s.dropped), std::mem::take(&mut s.expired), s.in_pass)
+            })
+            .unwrap_or_default();
+        if !expired.is_empty() {
+            ctx.request_repaint(); // Run the queued key/modifier cleanup and pointer cancellation.
+        }
         let passes = self.passes();
+        let current = Geometry::current(ctx, host.capture_epoch());
+        let mut reserved_total = self.reserved_bytes();
         let mut keep = Vec::new();
         for p in self.pending.drain(..) {
             match p {
-                Pending::Frames { until_pass, reply, value, .. } if passes >= until_pass => {
-                    let _ = reply.send(Ok(value));
-                }
-                Pending::Frames { since, reply, .. } if now - since > NOT_DRAWN_TIMEOUT => {
-                    // The agent is told it failed, so it must not happen later either.
-                    if let Ok(mut sh) = self.shared.lock() {
-                        sh.inject.clear();
+                Pending::Frames { until_pass, batches, since, reply, value } => {
+                    if batches.iter().any(|id| expired.contains(id)) {
+                        let _ = reply.send(Err(not_drawn("handling the input")));
+                    } else if batches.iter().any(|id| dropped.contains(id)) {
+                        let _ = reply.send(Err("the document, dialog or focus changed before the input could be applied; nothing was done".into()));
+                    } else if passes >= until_pass {
+                        let _ = reply.send(Ok(value));
+                    } else if !in_pass && now.duration_since(since) > timeout() {
+                        let _ = reply.send(Err(not_drawn("handling the input")));
+                    } else {
+                        keep.push(Pending::Frames { until_pass, batches, since, reply, value });
                     }
-                    let _ = reply.send(Err(not_drawn("handling the input")));
                 }
-                p @ Pending::Frames { .. } => keep.push(p),
-                Pending::Screenshot { tag, region, reply, since } => match shots.iter().find(|(t, _)| *t == tag) {
-                    Some((_, image)) => {
-                        let _ = reply.send(screenshot_png(image, region, ppp));
-                    }
-                    // The platform skips painting windows that are hidden, minimized or fully
-                    // covered, so no screenshot ever arrives: say so instead of hanging.
-                    None if now - since > NOT_DRAWN_TIMEOUT => {
+                Pending::Screenshot { slot, callback, region, reply, since, geometry, reserved, attempts } => {
+                    // Completion cannot restart or bypass the admission deadline, even when
+                    // the callback arrived before this delayed tick or a resize would retry it.
+                    if now.duration_since(since) > timeout() {
+                        slot.cancel();
+                        reserved_total = reserved_total.saturating_sub(reserved);
                         let _ = reply.send(Err(not_drawn("the screenshot")));
+                        continue;
                     }
-                    None => keep.push(Pending::Screenshot { tag, region, reply, since }),
-                },
+                    match slot.take() {
+                        Some(Ok(image)) => {
+                            if current.epoch != geometry.epoch {
+                                // The document/dialog changed: never save a capture of the
+                                // previous context, and do not retry it into the new one.
+                                reserved_total = reserved_total.saturating_sub(reserved);
+                                let _ = reply
+                                    .send(Err("the document or dialog changed while the screenshot was being captured; it was not saved".into()));
+                                continue;
+                            }
+                            if current.size != geometry.size || current.pixels_per_point != geometry.pixels_per_point {
+                                // A late completion after a resize/DPI change is never encoded:
+                                // retry once with a fresh slot, else report a defined error.
+                                if attempts < 1 {
+                                    if region.as_ref().is_some_and(|region| !current.contains_region(*region)) {
+                                        reserved_total = reserved_total.saturating_sub(reserved);
+                                        let _ = reply.send(Err("the region must lie inside the window".into()));
+                                        continue;
+                                    }
+                                    let Some(bytes) = current.image_bytes() else {
+                                        reserved_total = reserved_total.saturating_sub(reserved);
+                                        let _ = reply.send(Err("the window has no capturable size".into()));
+                                        continue;
+                                    };
+                                    let Some(new_total) = retried_reservation(reserved_total, reserved, bytes) else {
+                                        reserved_total = reserved_total.saturating_sub(reserved);
+                                        let _ = reply.send(Err("the screenshot no longer fits the screenshot budget".into()));
+                                        continue;
+                                    };
+                                    reserved_total = new_total;
+                                    let (new_slot, new_callback) = craft_ui::capture::CaptureSlot::new(ctx, egui::ViewportId::ROOT, MAX_IMAGE_BYTES);
+                                    keep.push(Pending::Screenshot {
+                                        slot: new_slot,
+                                        callback: Some(new_callback),
+                                        region,
+                                        reply,
+                                        since,
+                                        geometry: current,
+                                        reserved: bytes,
+                                        attempts: attempts + 1,
+                                    });
+                                } else {
+                                    reserved_total = reserved_total.saturating_sub(reserved);
+                                    let _ = reply
+                                        .send(Err("the window geometry changed while the screenshot was being captured; it was not saved".into()));
+                                }
+                                continue;
+                            }
+                            reserved_total = reserved_total.saturating_sub(reserved);
+                            let _ = reply.send(screenshot_png(&image, region, geometry));
+                        }
+                        Some(Err(error)) => {
+                            reserved_total = reserved_total.saturating_sub(reserved);
+                            let _ = reply.send(Err(format!("the screenshot could not be captured: {error}")));
+                        }
+                        None => keep.push(Pending::Screenshot { slot, callback, region, reply, since, geometry, reserved, attempts }),
+                    }
+                }
             }
         }
         self.pending = keep;
@@ -265,13 +730,35 @@ impl Control {
         self.shared.lock().map(|s| s.passes).unwrap_or(0)
     }
 
-    fn inject(&self, batches: Vec<Vec<egui::Event>>) -> u32 {
-        let n = batches.len() as u32;
-        if let Ok(mut s) = self.shared.lock() {
-            s.inject.extend(batches);
+    /// Queue one request's event batches (one per UI pass) and return its request id.
+    ///
+    /// The request is stamped once, at admission: all of its batches share the input-target
+    /// generation. A poisoned mutex or a full queue is an error, never a silently empty queue
+    /// that would let the caller answer `Ok` for input that never happened.
+    fn inject(&self, batches: Vec<Vec<egui::Event>>) -> Result<Vec<u64>, String> {
+        let mut s = self.shared.lock().map_err(|_| "control state poisoned".to_string())?;
+        let queued: usize = s.inject.iter().map(|request| request.batches.len()).sum();
+        if queued.saturating_add(batches.len()) > MAX_QUEUED_BATCHES {
+            return Err(format!("too many synthetic input batches are already queued (limit {MAX_QUEUED_BATCHES})"));
         }
-        // The last batch is handled during the frame it is injected into; answer one frame later.
-        n + 1
+        s.next_batch += 1;
+        let id = s.next_batch;
+        let epoch = s.epoch;
+        s.inject.push_back(RequestBatches {
+            request: id,
+            epoch,
+            started: false,
+            since: web_time::Instant::now(),
+            release: Vec::new(),
+            batches: batches.into(),
+        });
+        Ok(vec![id])
+    }
+
+    fn after_input(&self, batches: Vec<Vec<egui::Event>>, value: Value) -> Result<Handled, String> {
+        let frames = batches.len() as u32;
+        let batches = self.inject(batches)?;
+        Ok(Handled::AfterInput { batches, frames, value })
     }
 
     fn handle(&mut self, ctx: &egui::Context, host: &mut impl Host, method: &str, p: &Value) -> Handled {
@@ -279,8 +766,10 @@ impl Control {
         let r: Result<Handled, String> = (|| match method {
             "ui.state" => {
                 let mut state = host.state();
-                let size = ctx.input(|i| i.viewport_rect().size());
-                state["window"] = json!({ "width": size.x, "height": size.y, "pixels_per_point": ctx.pixels_per_point() });
+                // Viewport info is fresh in `logic`; the last UI pass's rectangle can be stale.
+                let geometry = Geometry::current(ctx, host.capture_epoch());
+                let size = geometry.size;
+                state["window"] = json!({ "width": size.x, "height": size.y, "pixels_per_point": geometry.pixels_per_point });
                 Ok(Handled::Now(Ok(state)))
             }
             "ui.commands" => Ok(Handled::Now(Ok(host.commands()))),
@@ -334,19 +823,18 @@ impl Control {
                         .ok_or_else(|| format!("ui.move: {key} must be a finite coordinate in points"))
                 };
                 let pos = egui::pos2(point("x")?, point("y")?);
-                Ok(Handled::AfterFrames(self.inject(vec![vec![egui::Event::PointerMoved(pos)]]), json!({ "moved": [pos.x, pos.y] })))
+                self.after_input(vec![vec![egui::Event::PointerMoved(pos)]], json!({ "moved": [pos.x, pos.y] }))
             }
             "ui.type" => {
                 let text = str_param("text")?.to_string();
-                Ok(Handled::AfterFrames(self.inject(vec![vec![egui::Event::Text(text)]]), json!({ "typed": true })))
+                self.after_input(vec![vec![egui::Event::Text(text)]], json!({ "typed": true }))
             }
             "ui.key" => {
                 let name = str_param("key")?;
                 let key = egui::Key::from_name(name)
                     .ok_or_else(|| format!("ui.key: unknown key {name:?} (egui key names: A, Enter, Escape, ArrowDown, F5, …)"))?;
                 let modifiers = modifiers(p.get("modifiers"))?;
-                let ev = |pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers };
-                Ok(Handled::AfterFrames(self.inject(vec![vec![ev(true)], vec![ev(false)]]), json!({ "key": name })))
+                self.after_input(key_batches(key, modifiers), json!({ "key": name }))
             }
             "ui.screenshot" => {
                 let region = match p.get("region") {
@@ -428,8 +916,7 @@ impl Control {
         if modifiers != egui::Modifiers::NONE {
             frames.push(vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
         }
-        let n = self.inject(frames);
-        Ok(Handled::AfterFrames(n, json!({ "dragged": [[from.x, from.y], [to.x, to.y]] })))
+        self.after_input(frames, json!({ "dragged": [[from.x, from.y], [to.x, to.y]] }))
     }
 
     fn click(&mut self, p: &Value) -> Result<Handled, String> {
@@ -441,8 +928,8 @@ impl Control {
             let which = pointer_button(p, "ui.click")?;
             let button = |pressed| egui::Event::PointerButton { pos, button: which, pressed, modifiers: egui::Modifiers::NONE };
             // Keep hover/layout warmup, then make an instantaneous click even on slow frames.
-            let frames = self.inject(vec![vec![egui::Event::PointerMoved(pos)], vec![button(true), button(false)]]);
-            return Ok(Handled::AfterFrames(frames, json!({ "clicked": [x, y] })));
+            let frames = vec![vec![egui::Event::PointerMoved(pos)], vec![button(true), button(false)]];
+            return self.after_input(frames, json!({ "clicked": [x, y] }));
         }
         let s = self.shared.lock().map_err(|_| "control state poisoned")?;
         let id = match (p.get("id"), p.get("label").and_then(Value::as_str)) {
@@ -478,8 +965,8 @@ impl Control {
         let label = node.label().map(str::to_owned);
         let action = accesskit::ActionRequest { action: Action::Click, target_tree: accesskit::TreeId::ROOT, target_node: id, data: None };
         drop(s);
-        let frames = self.inject(vec![vec![egui::Event::AccessKitActionRequest(action)]]);
-        Ok(Handled::AfterFrames(frames, json!({ "clicked": id.0.to_string(), "label": label })))
+        let frames = vec![vec![egui::Event::AccessKitActionRequest(action)]];
+        self.after_input(frames, json!({ "clicked": id.0.to_string(), "label": label }))
     }
 
     fn focus(&mut self, p: &Value) -> Result<Handled, String> {
@@ -510,14 +997,20 @@ impl Control {
         }
         let action = accesskit::ActionRequest { action: Action::Focus, target_tree: accesskit::TreeId::ROOT, target_node: id, data: None };
         drop(s);
-        let frames = self.inject(vec![vec![egui::Event::AccessKitActionRequest(action)]]);
-        Ok(Handled::AfterFrames(frames, json!({ "focus_requested": id.0.to_string() })))
+        let frames = vec![vec![egui::Event::AccessKitActionRequest(action)]];
+        self.after_input(frames, json!({ "focus_requested": id.0.to_string() }))
     }
 }
 
 enum Handled {
     Now(Reply),
+    /// Answer after this many accepted UI passes, without injecting input.
     AfterFrames(u32, Value),
+    AfterInput {
+        batches: Vec<u64>,
+        frames: u32,
+        value: Value,
+    },
     Screenshot(Option<egui::Rect>),
 }
 
@@ -582,6 +1075,23 @@ fn pointer_button(p: &Value, method: &str) -> Result<egui::PointerButton, String
     }
 }
 
+/// The events for one synthetic key press. egui updates `InputState.modifiers` only from
+/// `ModifiersChanged`, not from the `modifiers` field on a key event, so the held set goes in
+/// before the press and is released after the key-up. Without this, handlers that read
+/// `i.modifiers` (Shift+Tab, ⌘Enter) would see stale state.
+fn key_batches(key: egui::Key, modifiers: egui::Modifiers) -> Vec<Vec<egui::Event>> {
+    let key_event = |pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers };
+    let mut press = vec![key_event(true)];
+    if modifiers != egui::Modifiers::NONE {
+        press.insert(0, egui::Event::ModifiersChanged(modifiers));
+    }
+    let mut release = vec![key_event(false)];
+    if modifiers != egui::Modifiers::NONE {
+        release.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    }
+    vec![press, release]
+}
+
 fn modifiers(v: Option<&Value>) -> Result<egui::Modifiers, String> {
     let mut m = egui::Modifiers::NONE;
     for name in v.and_then(Value::as_array).into_iter().flatten() {
@@ -614,19 +1124,47 @@ fn rect_param(v: &Value) -> Result<egui::Rect, String> {
 }
 
 /// Encode (a region of) a screenshot as PNG; the reply carries base64 data and the size.
-fn screenshot_png(image: &egui::ColorImage, region: Option<egui::Rect>, ppp: f32) -> Reply {
+///
+/// The image scale is derived from the returned pixels and the logical viewport the capture was
+/// admitted for, never from the current `Context`: egui-wgpu's surface fit may have shrunk the
+/// surface (and a resize/DPI change has already been rejected before this call).
+fn screenshot_png(image: &egui::ColorImage, region: Option<egui::Rect>, geometry: Geometry) -> Reply {
     let [w, h] = image.size;
+    let view = geometry.size;
+    if w == 0 || h == 0 {
+        return Err("the screenshot has no pixels".into());
+    }
+    if !(view.x.is_finite() && view.y.is_finite()) || view.x <= 0.0 || view.y <= 0.0 {
+        return Err("the window has no capturable size".into());
+    }
+    if region.is_some_and(|region| !geometry.contains_region(region)) {
+        return Err("the region must lie inside the window".into());
+    }
+    let scale_x = w as f32 / view.x;
+    let scale_y = h as f32 / view.y;
+    // A fitted surface shrinks both sides by one factor; a different x/y scale means the window
+    // changed shape and this image cannot be cropped honestly.
+    if (scale_x - scale_y).abs() > 0.01 * scale_x.max(1.0) {
+        return Err("the screenshot's aspect ratio does not match the window".into());
+    }
     let (x0, y0, x1, y1) = match region {
         Some(r) => {
-            let px = |v: f32, max: usize| ((v * ppp).round().max(0.0) as usize).min(max);
-            (px(r.min.x, w), px(r.min.y, h), px(r.max.x, w), px(r.max.y, h))
+            let px = |v: f32, scale: f32, max: usize| ((v * scale).round().max(0.0) as usize).min(max);
+            (px(r.min.x, scale_x, w), px(r.min.y, scale_y, h), px(r.max.x, scale_x, w), px(r.max.y, scale_y, h))
         }
         None => (0, 0, w, h),
     };
     if x1 <= x0 || y1 <= y0 {
         return Err("the region is outside the window".into());
     }
-    let mut rgba = Vec::with_capacity((x1 - x0) * (y1 - y0) * 4);
+    let crop_bytes = (x1 - x0)
+        .checked_mul(y1 - y0)
+        .and_then(|pixels| pixels.checked_mul(core::mem::size_of::<egui::Color32>()))
+        .ok_or_else(|| "the screenshot region is too large".to_string())?;
+    if crop_bytes > MAX_ENCODED_BYTES {
+        return Err(format!("the screenshot region would need {crop_bytes} bytes to encode, over the {MAX_ENCODED_BYTES}-byte encode limit"));
+    }
+    let mut rgba = Vec::with_capacity(crop_bytes);
     for y in y0..y1 {
         for px in &image.pixels[y * w + x0..y * w + x1] {
             rgba.extend_from_slice(&px.to_srgba_unmultiplied());
@@ -640,11 +1178,68 @@ fn screenshot_png(image: &egui::ColorImage, region: Option<egui::Rect>, ppp: f32
     let mut writer = enc.write_header().map_err(|e| e.to_string())?;
     writer.write_image_data(&rgba).map_err(|e| e.to_string())?;
     writer.finish().map_err(|e| e.to_string())?;
+    if out.len() > MAX_ENCODED_BYTES {
+        return Err(format!("the encoded screenshot is {} bytes, over the {MAX_ENCODED_BYTES}-byte encode limit", out.len()));
+    }
+    let encoded = out.len().div_ceil(3).checked_mul(4).ok_or_else(|| "the encoded screenshot is too large".to_string())?;
+    if encoded > MAX_BASE64_BYTES {
+        return Err(format!("the screenshot's base64 reply would be {encoded} bytes, over the {MAX_BASE64_BYTES}-byte limit"));
+    }
     use base64::Engine as _;
-    Ok(json!({ "png_base64": base64::engine::general_purpose::STANDARD.encode(out), "width": cw, "height": ch, "pixels_per_point": ppp }))
+    Ok(json!({
+        "png_base64": base64::engine::general_purpose::STANDARD.encode(out),
+        "width": cw,
+        "height": ch,
+        "pixels_per_point": scale_x,
+    }))
 }
 
 impl Host for crate::PdfCraftApp {
+    fn cancel_pointer_gestures(&mut self) {
+        for view in &mut self.views {
+            view.cancel_pointer_gestures();
+        }
+    }
+
+    /// The input target: active document, open dialog/prompt, palette and find state.
+    ///
+    /// Synthetic input admitted for one generation is never replayed into another document or
+    /// dialog. Only these identities are hashed, never text or document content.
+    fn input_epoch(&self) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.capture_epoch().hash(&mut hasher);
+        // The focused widget is part of the input target: keys typed for one field must not land
+        // in another after focus moves. Only the id value is hashed, never text.
+        let focused = self.ctx.as_ref().and_then(|ctx| ctx.memory(|m| m.focused())).map(|id| id.value());
+        focused.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// The captured content: active document and open dialog/prompt, never keyboard focus.
+    fn capture_epoch(&self) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let doc = self.active.and_then(|i| self.views.get(i)).map(|v| v.id.0);
+        doc.hash(&mut hasher);
+        format!(
+            "{:?}/{:?}/{:?}/{:?}/{:?}",
+            self.dialog,
+            self.password_prompt.is_some(),
+            self.palette_open,
+            self.close_request.is_some(),
+            self.active.and_then(|i| self.views.get(i)).and_then(|v| v.find.as_ref().map(|_| true)),
+        )
+        .hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Control requests wait for the first UI pass that installs fonts; a font-gated early
+    /// return cannot consume injected input or issue a screenshot.
+    fn accepts_input(&self) -> bool {
+        self.fonts_ready
+    }
+
     fn dock(&mut self, reset: bool, params: &Value) -> Reply {
         crate::docking::command(self, reset, params)
     }
@@ -731,6 +1326,7 @@ impl Host for crate::PdfCraftApp {
             "home": self.active.is_none(),
             "mode": format!("{:?}", self.mode),
             "default_mode": self.default_mode,
+            "comment_tool_pinned": self.comment_prefs.pinned,
             "left_panel": if self.left_open { json!(format!("{:?}", self.left)) } else { Value::Null },
             "tools_side": if self.docking.tools_on_right() { "right" } else { "left" },
             "right_panel": self.right.map(|r| format!("{r:?}")),
@@ -1399,6 +1995,754 @@ mod transport_tests {
 }
 
 #[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use egui::Plugin as _;
+
+    /// A request is answered after accepted frames only: a discarded layout pass is not a frame
+    /// the agent can see, so it must not advance the count.
+    #[test]
+    fn discarded_passes_are_not_counted_as_accepted_frames() {
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let mut plugin = ControlPlugin { shared: shared.clone() };
+        let ctx = egui::Context::default();
+        let mut accepted = egui::FullOutput::default();
+        plugin.output_hook(&ctx, &mut accepted);
+        let mut discarded = egui::FullOutput::default();
+        discarded.platform_output.request_discard_reasons.push(egui::RepaintCause::new_reason("control test discard"));
+        plugin.output_hook(&ctx, &mut discarded);
+        assert_eq!(shared.lock().unwrap().passes, 1, "only the presented pass counts");
+    }
+
+    /// A frame that requests discard on every pass and hits `max_passes` still presents its
+    /// last pass: that presented pass must count, or `Pending::Frames` waits for a frame that
+    /// never arrives. This runs the real multi-pass loop rather than a hand-built FullOutput.
+    #[test]
+    fn a_final_capped_pass_is_counted_as_presented() {
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let ctx = egui::Context::default();
+        ctx.add_plugin(ControlPlugin { shared: shared.clone() });
+        ctx.options_mut(|o| o.max_passes = 2.try_into().expect("two is non-zero"));
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| ui.ctx().request_discard("control test must discard"));
+        output.textures_delta.clear();
+        assert_eq!(output.platform_output.num_completed_passes, 2, "the cap was reached");
+        assert!(!output.platform_output.request_discard_reasons.is_empty(), "the last pass still requested a discard");
+        assert_eq!(shared.lock().unwrap().passes, 1, "the presented final pass counts once");
+    }
+
+    /// `max_passes` above two still counts a frame that settles after earlier discarded passes:
+    /// egui clears the previous pass's discard reasons at the start of each pass, so the merged
+    /// output of a presented final pass is not mistaken for a discarded one.
+    #[test]
+    fn a_frame_that_settles_before_a_higher_pass_cap_is_counted_once() {
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let ctx = egui::Context::default();
+        ctx.add_plugin(ControlPlugin { shared: shared.clone() });
+        ctx.options_mut(|o| o.max_passes = 3.try_into().expect("three is non-zero"));
+        let mut pass = 0;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            pass += 1;
+            if pass < 3 {
+                ui.ctx().request_discard("control test must discard the first two passes");
+            }
+        });
+        output.textures_delta.clear();
+        assert_eq!(output.platform_output.num_completed_passes, 3, "the third pass settled at the higher cap");
+        assert!(output.platform_output.request_discard_reasons.is_empty(), "earlier discard reasons do not survive the settling pass");
+        assert_eq!(shared.lock().unwrap().passes, 1, "the one presented frame counts once");
+    }
+
+    /// `ui.key` delivers held modifiers through `ModifiersChanged`, because egui does not derive
+    /// `InputState.modifiers` from a key event's own field. Shift+Tab and ⌘Enter handlers read it.
+    #[test]
+    fn key_commands_deliver_modifier_state() {
+        let held = egui::Modifiers { command: true, ctrl: true, ..egui::Modifiers::NONE };
+        let batches = key_batches(egui::Key::Enter, held);
+        let key = |pressed| egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed, repeat: false, modifiers: held };
+        assert_eq!(
+            batches,
+            vec![vec![egui::Event::ModifiersChanged(held), key(true)], vec![key(false), egui::Event::ModifiersChanged(egui::Modifiers::NONE)]]
+        );
+        let ctx = egui::Context::default();
+        let mut press_seen = None;
+        ctx.run_ui(egui::RawInput { events: batches[0].clone(), ..Default::default() }, |ui| press_seen = Some(ui.input(|i| i.modifiers)))
+            .textures_delta
+            .clear();
+        let mut release_seen = None;
+        ctx.run_ui(egui::RawInput { events: batches[1].clone(), ..Default::default() }, |ui| release_seen = Some(ui.input(|i| i.modifiers)))
+            .textures_delta
+            .clear();
+        assert_eq!(press_seen, Some(held), "the press sees the modifiers it was sent with");
+        assert_eq!(release_seen, Some(egui::Modifiers::NONE), "the modifier release follows the key-up");
+    }
+
+    /// A batch admitted for one document/focus generation must not apply after that generation
+    /// changes; the request is reported as stale instead of replaying the input.
+    #[test]
+    fn a_stale_synthetic_batch_is_dropped_and_reported() {
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let mut plugin = ControlPlugin { shared: shared.clone() };
+        {
+            let mut s = shared.lock().unwrap();
+            s.epoch = 2;
+            s.inject.push_back(RequestBatches {
+                request: 41,
+                epoch: 1,
+                started: false,
+                since: web_time::Instant::now(),
+                release: Vec::new(),
+                batches: VecDeque::from([vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))]]),
+            });
+        }
+        let mut raw = egui::RawInput::default();
+        plugin.input_hook(&egui::Context::default(), &mut raw);
+        assert!(raw.events.is_empty(), "stale input must not reach the new document");
+        let s = shared.lock().unwrap();
+        assert_eq!(s.dropped, vec![41]);
+        assert!(s.inject.is_empty());
+    }
+
+    /// A stale request is dropped alone. A request admitted later for the current generation
+    /// behind it still runs: one agent's outdated input must not fail another's.
+    #[test]
+    fn a_stale_request_does_not_drop_a_later_current_one() {
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let mut plugin = ControlPlugin { shared: shared.clone() };
+        {
+            let mut s = shared.lock().unwrap();
+            s.epoch = 2;
+            s.inject.push_back(RequestBatches {
+                request: 41,
+                epoch: 1,
+                started: false,
+                since: web_time::Instant::now(),
+                release: Vec::new(),
+                batches: VecDeque::from([vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))]]),
+            });
+            s.inject.push_back(RequestBatches {
+                request: 42,
+                epoch: 2,
+                started: false,
+                since: web_time::Instant::now(),
+                release: Vec::new(),
+                batches: VecDeque::from([vec![egui::Event::PointerMoved(egui::pos2(2.0, 2.0))]]),
+            });
+        }
+        let ctx = egui::Context::default();
+        let mut first = egui::RawInput::default();
+        plugin.input_hook(&ctx, &mut first);
+        assert!(first.events.is_empty(), "the stale request is not replayed");
+        let mut second = egui::RawInput::default();
+        plugin.input_hook(&ctx, &mut second);
+        assert_eq!(second.events, [egui::Event::PointerMoved(egui::pos2(2.0, 2.0))], "the current request still applies");
+        let s = shared.lock().unwrap();
+        assert_eq!(s.dropped, vec![41]);
+        assert!(s.inject.is_empty());
+    }
+
+    /// Once a request has started, the focus/dialog change caused by its own first batch must not
+    /// drop its release: a key press without its release leaves `keys_down` stuck.
+    #[test]
+    fn a_started_request_finishes_its_batches_after_focus_moves() {
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let mut plugin = ControlPlugin { shared: shared.clone() };
+        {
+            let mut s = shared.lock().unwrap();
+            s.epoch = 7;
+            s.inject.push_back(RequestBatches {
+                request: 9,
+                epoch: 7,
+                started: false,
+                since: web_time::Instant::now(),
+                release: Vec::new(),
+                batches: VecDeque::from([
+                    vec![egui::Event::Key {
+                        key: egui::Key::Tab,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    vec![egui::Event::Key {
+                        key: egui::Key::Tab,
+                        physical_key: None,
+                        pressed: false,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                ]),
+            });
+        }
+        let ctx = egui::Context::default();
+        let mut press = egui::RawInput::default();
+        plugin.input_hook(&ctx, &mut press);
+        assert!(matches!(press.events.as_slice(), [egui::Event::Key { pressed: true, .. }]));
+        // The press moved focus: the next pass sees another input-target generation.
+        shared.lock().unwrap().epoch = 8;
+        let mut release = egui::RawInput::default();
+        plugin.input_hook(&ctx, &mut release);
+        assert!(matches!(release.events.as_slice(), [egui::Event::Key { pressed: false, .. }]), "the release still arrives");
+        let s = shared.lock().unwrap();
+        assert!(s.dropped.is_empty(), "a started request is not reported as stale");
+        assert!(s.inject.is_empty());
+    }
+
+    /// A host for timeout tests: the control layer must not need a real app.
+    struct NoopHost;
+
+    impl Host for NoopHost {
+        fn state(&self) -> Value {
+            json!({})
+        }
+        fn command(&mut self, _id: &str) -> Reply {
+            Err("no commands in this test".into())
+        }
+        fn dock(&mut self, _reset: bool, _params: &Value) -> Reply {
+            Err("no docking in this test".into())
+        }
+        fn commands(&self) -> Value {
+            json!([])
+        }
+        fn set(&mut self, _key: &str, _value: &str) -> Reply {
+            Err("no settings in this test".into())
+        }
+        fn open(&mut self, _path: &str) -> Reply {
+            Err("no files in this test".into())
+        }
+        fn quit(&mut self, _ctx: &egui::Context) -> bool {
+            false
+        }
+    }
+
+    /// Keep key/modifier cleanup, but a canceled pointer must never produce a release event.
+    #[test]
+    fn a_timed_out_started_request_cancels_pointer_and_releases_keys() {
+        let ctx = egui::Context::default();
+        let (mut control, _client) = attach(&ctx);
+        let held = egui::Modifiers { command: true, ctrl: true, ..egui::Modifiers::NONE };
+        let pos = egui::pos2(24.0, 32.0);
+        let key = |pressed| egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed, repeat: false, modifiers: held };
+        let ids = control
+            .inject(vec![
+                vec![
+                    egui::Event::ModifiersChanged(held),
+                    key(true),
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: held },
+                ],
+                vec![egui::Event::PointerMoved(egui::pos2(40.0, 48.0))],
+                vec![key(false), egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: held }],
+            ])
+            .unwrap();
+        let (reply, rx) = channel();
+        control.pending.push(Pending::Frames { until_pass: u64::MAX, batches: ids, since: web_time::Instant::now(), reply, value: json!({}) });
+        ctx.run_ui(egui::RawInput::default(), |_| {}).drop_without_applying_deltas();
+        assert!(ctx.input(|i| i.keys_down.contains(&egui::Key::Enter) && i.pointer.primary_down()));
+        assert_eq!(ctx.input(|i| i.modifiers), held);
+        age_input(&mut control);
+        let next = egui::pos2(80.0, 90.0);
+        control.inject(vec![vec![egui::Event::PointerMoved(next)]]).unwrap();
+        control.finish_pending(&ctx, &mut NoopHost);
+        assert!(rx.try_recv().unwrap().unwrap_err().contains("not being drawn"));
+        assert!(control.pending.is_empty());
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            assert!(!ui.input(|i| i.keys_down.contains(&egui::Key::Enter)));
+            assert_eq!(ui.input(|i| i.modifiers), egui::Modifiers::NONE);
+            assert_eq!(ui.input(|i| i.pointer.hover_pos()), Some(next), "another live request survives");
+            assert!(!ui.input(|i| i.pointer.any_down() || i.pointer.any_released()));
+            assert!(ui.ctx().dragged_id().is_none() && ui.ctx().drag_stopped_id().is_none());
+        })
+        .drop_without_applying_deltas();
+        assert!(control.shared.lock().unwrap().inject.is_empty());
+        assert!(rx.try_recv().is_err(), "only one timeout reply");
+    }
+
+    #[test]
+    fn a_deadline_crossing_inside_an_admitted_pass_cancels_before_the_next_interaction() {
+        let ctx = egui::Context::default();
+        let (mut control, _client) = attach(&ctx);
+        let pos = egui::pos2(24.0, 32.0);
+        let ids = control
+            .inject(vec![
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+                ],
+                vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }],
+            ])
+            .unwrap();
+        let (reply, rx) = channel();
+        control.pending.push(Pending::Frames { until_pass: u64::MAX, batches: ids, since: web_time::Instant::now(), reply, value: json!({}) });
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            assert!(ui.input(|i| i.pointer.primary_down()), "the press was admitted before expiry");
+            age_input(&mut control);
+            control.finish_pending(ui.ctx(), &mut NoopHost);
+            assert!(rx.try_recv().is_err(), "do not cancel an already-calculated interaction mid-pass");
+        })
+        .drop_without_applying_deltas();
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            control.finish_pending(ui.ctx(), &mut NoopHost);
+            assert!(!ui.input(|i| i.pointer.any_down() || i.pointer.any_released()));
+            assert!(ui.ctx().drag_stopped_id().is_none());
+        })
+        .drop_without_applying_deltas();
+        assert!(rx.try_recv().unwrap().unwrap_err().contains("not being drawn"));
+        assert!(control.shared.lock().unwrap().inject.is_empty());
+    }
+
+    /// Deterministic elapsed-time input: age the same admission in both halves, without sleeping
+    /// or fabricating any egui pointer/widget state.
+    fn age_input(control: &mut Control) {
+        let past = web_time::Instant::now().checked_sub(std::time::Duration::from_secs(10)).unwrap();
+        for request in &mut control.shared.lock().unwrap().inject {
+            request.since = past;
+        }
+        for pending in &mut control.pending {
+            if let Pending::Frames { since, .. } = pending {
+                *since = past;
+            }
+        }
+    }
+
+    /// Real page hit-testing, real control batches and the production marquee completion path.
+    /// Exercise both hidden-logic expiry and expiry first observed by the next input hook.
+    #[test]
+    fn a_timed_out_marquee_never_zooms_and_completed_clicks_and_drags_still_work() {
+        use egui_kittest::Harness;
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Gesture {
+            AtomicClick,
+            HeldClick,
+            Marquee,
+        }
+        let request = |gesture, from: egui::Pos2, to: egui::Pos2| match gesture {
+            Gesture::AtomicClick => ("ui.click", json!({"x": from.x, "y": from.y})),
+            Gesture::HeldClick => ("ui.drag", json!({"from": [from.x, from.y], "to": [from.x, from.y], "steps": 6})),
+            Gesture::Marquee => ("ui.drag", json!({"from": [from.x, from.y], "to": [to.x, to.y], "steps": 6})),
+        };
+        for hidden_logic in [false, true] {
+            for gesture in [Gesture::AtomicClick, Gesture::HeldClick, Gesture::Marquee] {
+                let client_slot = Arc::new(Mutex::new(None));
+                let slot = client_slot.clone();
+                let mut h = Harness::builder().with_size(egui::vec2(1200.0, 900.0)).with_step_dt(0.01).build_eframe(move |cc| {
+                    let mut app = crate::PdfCraftApp::new();
+                    app.set_option("language", "en").unwrap();
+                    app.open_bytes("synthetic-form.pdf", None, include_bytes!("../tests/data/form.pdf").to_vec()).unwrap();
+                    app.set_option("quick", "marquee-zoom").unwrap();
+                    *slot.lock().unwrap() = Some(app.attach_control(&cc.egui_ctx));
+                    app
+                });
+                let client = client_slot.lock().unwrap().take().unwrap();
+                let step = |h: &mut Harness<'_, crate::PdfCraftApp>| {
+                    let ctx = h.ctx.clone();
+                    let mut raw = std::mem::take(h.input_mut());
+                    h.state_mut().prepare_raw_input(&ctx, &mut raw);
+                    *h.input_mut() = raw;
+                    h.step();
+                };
+                let target = |h: &Harness<'_, crate::PdfCraftApp>| {
+                    let page = h.state().views[0]
+                        .page_screen_rect(0)
+                        .expect("the actual PDF page was laid out")
+                        .intersect(h.state().views[0].viewport_rect());
+                    assert!(page.width() > 100.0 && page.height() > 100.0, "a visible hit target: {page:?}");
+                    let from = page.center();
+                    let to = from + egui::vec2(40.0, 50.0);
+                    assert!(page.contains(to));
+                    (from, to)
+                };
+                for _ in 0..5 {
+                    step(&mut h);
+                }
+                let (from, to) = target(&h);
+                let zoom = h.state().views[0].zoom;
+                let bytes = h.state().session.get(h.state().views[0].id).unwrap().bytes.clone();
+                let (method, params) = request(gesture, from, to);
+                let reply = client.send(method, params);
+                let mut admitted = false;
+                for _ in 0..8 {
+                    step(&mut h);
+                    admitted = if gesture == Gesture::AtomicClick {
+                        let shared = h.state().control.as_ref().unwrap().shared.lock().unwrap();
+                        shared.inject.front().is_some_and(|request| request.started && request.batches.len() == 1)
+                    } else {
+                        h.ctx.input(|i| i.pointer.primary_down()) && (gesture != Gesture::Marquee || h.state().views[0].marquee.is_some())
+                    };
+                    if admitted {
+                        break;
+                    }
+                }
+                assert!(admitted, "a real interruptible admission: {gesture:?}, hidden={hidden_logic}");
+                {
+                    let shared = h.state().control.as_ref().unwrap().shared.lock().unwrap();
+                    assert_eq!(shared.inject.len(), 1, "only the actual public request is queued");
+                    let pending = shared.inject.front().unwrap();
+                    assert!(pending.started);
+                    let terminal = pending.batches.back().expect("the terminal batch is still pending");
+                    if gesture == Gesture::AtomicClick {
+                        assert_eq!(pending.batches.len(), 1);
+                        assert_eq!(terminal.len(), 2);
+                        assert!(
+                            matches!(terminal[0], egui::Event::PointerButton { pressed: true, button: egui::PointerButton::Primary, pos, .. } if pos == from)
+                        );
+                        assert!(
+                            matches!(terminal[1], egui::Event::PointerButton { pressed: false, button: egui::PointerButton::Primary, pos, .. } if pos == from)
+                        );
+                        assert!(!h.ctx.input(|i| i.pointer.primary_down()), "atomic click has only hovered so far");
+                    } else {
+                        assert!(h.ctx.input(|i| i.pointer.primary_down()), "a real pass consumed the press");
+                        assert_eq!(terminal.len(), 1);
+                        assert!(matches!(terminal[0], egui::Event::PointerButton { pressed: false, button: egui::PointerButton::Primary, .. }));
+                    }
+                }
+                assert!(!h.ctx.input(|i| i.pointer.any_released()), "the terminal release has not run");
+                assert!(h.ctx.drag_stopped_id().is_none());
+                if gesture == Gesture::Marquee {
+                    assert!(h.ctx.dragged_id().is_some() && h.state().views[0].marquee.is_some(), "the app has a real drag preview");
+                } else {
+                    assert!(h.state().views[0].marquee.is_none() && h.state().views[0].marquee_done.is_none());
+                }
+                assert!(reply.try_recv().is_err(), "the terminal batch has not run");
+                assert_eq!(h.state().views[0].zoom, zoom);
+                assert_eq!(h.state().session.get(h.state().views[0].id).unwrap().bytes, bytes);
+                age_input(h.state_mut().control.as_mut().unwrap());
+                if hidden_logic {
+                    let ctx = h.ctx.clone();
+                    let app = h.state_mut();
+                    let mut control = app.control.take().unwrap();
+                    control.tick(&ctx, app);
+                    app.control = Some(control);
+                    assert!(reply.try_recv().unwrap().unwrap_err().contains("not being drawn"));
+                }
+                step(&mut h);
+                if !hidden_logic {
+                    assert!(reply.try_recv().unwrap().unwrap_err().contains("not being drawn"));
+                }
+                for _ in 0..2 {
+                    step(&mut h);
+                }
+                assert!(!h.ctx.input(|i| i.pointer.any_down() || i.pointer.any_released()));
+                assert!(h.ctx.dragged_id().is_none() && h.ctx.drag_stopped_id().is_none());
+                assert!(h.state().views[0].marquee.is_none() && h.state().views[0].marquee_done.is_none());
+                assert_eq!(h.state().views[0].zoom, zoom, "canceling must not turn a drag into a zoom click");
+                assert_eq!(h.state().session.get(h.state().views[0].id).unwrap().bytes, bytes, "no abandoned edit");
+                assert!(h.state().control.as_ref().unwrap().shared.lock().unwrap().inject.is_empty());
+                assert!(h.state().control.as_ref().unwrap().pending.is_empty());
+                assert!(reply.try_recv().is_err(), "the cancellation replies once");
+
+                // Complete the same public gesture, then an atomic click after held input.
+                // Real event traces prove the stationary drag is a valid short point click.
+                let positives = [gesture, Gesture::AtomicClick];
+                let count = if gesture == Gesture::AtomicClick { 1 } else { 2 };
+                for positive in positives.into_iter().take(count) {
+                    let (from, to) = target(&h);
+                    let zoom = h.state().views[0].zoom;
+                    let (method, params) = request(positive, from, to);
+                    let reply = client.send(method, params);
+                    let mut value = None;
+                    let mut buttons = Vec::new();
+                    let mut positions = Vec::new();
+                    for _ in 0..20 {
+                        step(&mut h);
+                        h.ctx.input(|i| {
+                            for event in &i.events {
+                                match event {
+                                    egui::Event::PointerButton { button: egui::PointerButton::Primary, pressed, pos, .. } => {
+                                        buttons.push((*pressed, i.time));
+                                        positions.push(*pos);
+                                    }
+                                    egui::Event::PointerMoved(pos) => positions.push(*pos),
+                                    _ => {}
+                                }
+                            }
+                        });
+                        if let Ok(result) = reply.try_recv() {
+                            value = Some(result.unwrap());
+                            break;
+                        }
+                    }
+                    assert!(value.is_some(), "a fresh completed request succeeds: {positive:?}, after {gesture:?}");
+                    assert_eq!(buttons.iter().map(|(pressed, _)| *pressed).collect::<Vec<_>>(), [true, false]);
+                    assert!(!h.ctx.input(|i| i.pointer.any_down()));
+                    assert!(h.ctx.dragged_id().is_none());
+                    if positive == Gesture::Marquee {
+                        assert!(h.state().views[0].zoom > zoom, "the normal marquee rectangle zooms");
+                    } else {
+                        let options = h.ctx.options(|o| o.input_options);
+                        assert!(buttons[1].1 - buttons[0].1 < options.max_click_duration, "real press/release remain a short click");
+                        assert!(positions.iter().all(|pos| pos.distance(from) < options.max_click_dist), "real input remains stationary");
+                        assert!((h.state().views[0].zoom - zoom * 1.5).abs() < 0.001, "a normal click zooms one step");
+                    }
+                    assert!(h.state().views[0].marquee.is_none() && h.state().views[0].marquee_done.is_none());
+                    assert_eq!(h.state().session.get(h.state().views[0].id).unwrap().bytes, bytes, "completed zooms do not edit the document");
+                    assert!(reply.try_recv().is_err(), "successful request replies once");
+                }
+            }
+        }
+    }
+
+    /// A screenshot that times out cancels its slot and gives its reservation back, with a
+    /// defined error instead of a silent success.
+    #[test]
+    fn a_timed_out_screenshot_releases_its_slot_and_budget() {
+        struct FakeHost;
+        impl Host for FakeHost {
+            fn state(&self) -> Value {
+                json!({})
+            }
+            fn command(&mut self, _id: &str) -> Reply {
+                Err("no commands in this test".into())
+            }
+            fn dock(&mut self, _reset: bool, _params: &Value) -> Reply {
+                Err("no docking in this test".into())
+            }
+            fn commands(&self) -> Value {
+                json!([])
+            }
+            fn set(&mut self, _key: &str, _value: &str) -> Reply {
+                Err("no settings in this test".into())
+            }
+            fn open(&mut self, _path: &str) -> Reply {
+                Err("no files in this test".into())
+            }
+            fn quit(&mut self, _ctx: &egui::Context) -> bool {
+                false
+            }
+        }
+        let ctx = egui::Context::default();
+        let (mut control, _client) = attach(&ctx);
+        let (slot, callback) = craft_ui::capture::CaptureSlot::new(&ctx, egui::ViewportId::ROOT, MAX_IMAGE_BYTES);
+        let (reply, rx) = channel();
+        control.pending.push(Pending::Screenshot {
+            slot,
+            callback: Some(callback),
+            region: None,
+            reply,
+            since: web_time::Instant::now().checked_sub(std::time::Duration::from_secs(10)).unwrap_or_else(web_time::Instant::now),
+            geometry: Geometry { size: egui::vec2(800.0, 600.0), pixels_per_point: 1.0, epoch: 0 },
+            reserved: 800 * 600 * 4,
+            attempts: 0,
+        });
+        control.finish_pending(&ctx, &mut FakeHost);
+        let error = rx.try_recv().expect("the request is answered").expect_err("a timeout is an error");
+        assert!(error.contains("not being drawn"), "{error}");
+        assert_eq!(control.reserved_bytes(), 0, "the reservation is released");
+        assert!(control.pending.is_empty(), "the cancelled capture is not retried");
+    }
+
+    /// A real successful callback must not bypass expiry, including when resize would otherwise
+    /// retry it. A non-expired completion still produces a real encoded PNG reply.
+    #[test]
+    fn completed_screenshots_obey_the_admission_deadline_before_success_or_retry() {
+        for (expired, resized) in [(false, false), (true, false), (true, true)] {
+            let ctx = egui::Context::default();
+            ctx.run_ui(
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(64.0, 32.0))), ..Default::default() },
+                |_| {},
+            )
+            .drop_without_applying_deltas();
+            let (mut control, _client) = attach(&ctx);
+            let geometry = Geometry::current(&ctx, 0);
+            let (slot, callback) = craft_ui::capture::CaptureSlot::new(&ctx, egui::ViewportId::ROOT, MAX_IMAGE_BYTES);
+            let image = Arc::new(egui::ColorImage::filled([64, 32], egui::Color32::RED));
+            let weak_image = Arc::downgrade(&image);
+            callback.complete(image);
+            assert!(weak_image.upgrade().is_some(), "the completed slot really retains pixels");
+            let (reply, rx) = channel();
+            control.pending.push(Pending::Screenshot {
+                slot,
+                callback: None,
+                region: None,
+                reply,
+                since: if expired {
+                    web_time::Instant::now().checked_sub(std::time::Duration::from_secs(10)).unwrap()
+                } else {
+                    web_time::Instant::now()
+                },
+                geometry,
+                reserved: geometry.image_bytes().unwrap(),
+                attempts: 0,
+            });
+            if resized {
+                ctx.run_ui(
+                    egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(80.0, 40.0))), ..Default::default() },
+                    |_| {},
+                )
+                .drop_without_applying_deltas();
+                assert_ne!(Geometry::current(&ctx, 0).size, geometry.size);
+            }
+            control.finish_pending(&ctx, &mut NoopHost);
+            let result = rx.try_recv().expect("one settled reply");
+            if expired {
+                assert!(result.unwrap_err().contains("not being drawn"), "expiry takes priority over success or resize");
+            } else {
+                let image = result.expect("the live completed capture still succeeds");
+                assert_eq!(image["width"], 64);
+                assert_eq!(image["height"], 32);
+                use base64::Engine as _;
+                let png = base64::engine::general_purpose::STANDARD.decode(image["png_base64"].as_str().expect("actual PNG reply")).unwrap();
+                assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+            }
+            assert!(control.pending.is_empty(), "an expired capture is never retried");
+            assert_eq!(control.reserved_bytes(), 0);
+            assert!(weak_image.upgrade().is_none(), "the slot releases its pixels");
+            assert!(rx.try_recv().is_err(), "exactly one reply");
+        }
+    }
+
+    #[test]
+    fn expired_unissued_screenshots_are_not_issued_and_late_callbacks_are_harmless() {
+        let ctx = egui::Context::default();
+        let (mut control, _client) = attach(&ctx);
+        let (slot, callback) = craft_ui::capture::CaptureSlot::new(&ctx, egui::ViewportId::ROOT, MAX_IMAGE_BYTES);
+        let late_callback = callback.clone();
+        let geometry = Geometry { size: egui::vec2(64.0, 32.0), pixels_per_point: 1.0, epoch: 0 };
+        let (reply, rx) = channel();
+        control.pending.push(Pending::Screenshot {
+            slot,
+            callback: Some(callback),
+            region: None,
+            reply,
+            since: web_time::Instant::now().checked_sub(std::time::Duration::from_secs(10)).unwrap(),
+            geometry,
+            reserved: 64 * 32 * 4,
+            attempts: 0,
+        });
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| control.finish_frame(ui.ctx(), &mut NoopHost));
+        assert!(
+            output
+                .viewport_output
+                .values()
+                .all(|viewport| !viewport.commands.iter().any(|command| matches!(command, egui::ViewportCommand::Screenshot(_))))
+        );
+        output.drop_without_applying_deltas();
+        assert!(rx.try_recv().unwrap().unwrap_err().contains("not being drawn"));
+        assert!(control.pending.is_empty());
+        assert_eq!(control.reserved_bytes(), 0);
+        let image = Arc::new(egui::ColorImage::filled([64, 32], egui::Color32::RED));
+        let weak_image = Arc::downgrade(&image);
+        late_callback.complete(image);
+        assert!(weak_image.upgrade().is_none(), "a late completion cannot resurrect a canceled request");
+        control.finish_pending(&ctx, &mut NoopHost);
+        assert!(rx.try_recv().is_err(), "no second reply");
+    }
+
+    /// One queued batch is consumed by exactly one UI pass.
+    #[test]
+    fn one_batch_is_consumed_by_one_pass() {
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let mut plugin = ControlPlugin { shared: shared.clone() };
+        {
+            let mut s = shared.lock().unwrap();
+            s.epoch = 3;
+            s.inject.push_back(RequestBatches {
+                request: 1,
+                epoch: 3,
+                started: false,
+                since: web_time::Instant::now(),
+                release: Vec::new(),
+                batches: VecDeque::from([vec![egui::Event::PointerMoved(egui::pos2(2.0, 3.0))]]),
+            });
+            s.inject.push_back(RequestBatches {
+                request: 2,
+                epoch: 3,
+                started: false,
+                since: web_time::Instant::now(),
+                release: Vec::new(),
+                batches: VecDeque::from([vec![egui::Event::PointerMoved(egui::pos2(4.0, 5.0))]]),
+            });
+        }
+        let mut first = egui::RawInput::default();
+        plugin.input_hook(&egui::Context::default(), &mut first);
+        assert_eq!(first.events.len(), 1);
+        let mut second = egui::RawInput::default();
+        plugin.input_hook(&egui::Context::default(), &mut second);
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0], egui::Event::PointerMoved(egui::pos2(4.0, 5.0)));
+        let mut third = egui::RawInput::default();
+        plugin.input_hook(&egui::Context::default(), &mut third);
+        assert!(third.events.is_empty(), "a consumed batch is never repeated");
+    }
+}
+
+#[cfg(test)]
+mod screenshot_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn image_bytes_are_checked_against_overflow_and_limits() {
+        assert_eq!(checked_image_bytes(2, 3), Some(24));
+        assert_eq!(checked_image_bytes(usize::MAX, 2), None);
+        let big = Geometry { size: egui::vec2(10_000.0, 10_000.0), pixels_per_point: 8.0, epoch: 0 };
+        assert!(big.image_bytes().is_some_and(|bytes| bytes > MAX_IMAGE_BYTES));
+    }
+
+    /// The crop is derived from the returned pixels and the admitted logical rect, not from a
+    /// current `pixels_per_point`: a fitted surface may return a smaller image.
+    #[test]
+    fn region_crop_uses_the_capture_geometry() {
+        let image = egui::ColorImage::filled([200, 100], egui::Color32::RED);
+        let geometry = Geometry { size: egui::vec2(100.0, 50.0), pixels_per_point: 2.0, epoch: 7 };
+        let reply =
+            screenshot_png(&image, Some(egui::Rect::from_min_max(egui::pos2(10.0, 5.0), egui::pos2(60.0, 30.0))), geometry).expect("a valid crop");
+        assert_eq!(reply["width"], 100);
+        assert_eq!(reply["height"], 50);
+        assert_eq!(reply["pixels_per_point"], 2.0);
+    }
+
+    /// A retry replaces one reservation in a running aggregate. Three 50 MiB captures that each
+    /// retry to 100 MiB must not all be admitted against a stale 150 MiB snapshot.
+    #[test]
+    fn retries_keep_one_running_aggregate_budget() {
+        const MIB: usize = 1024 * 1024;
+        let first = retried_reservation(3 * 50 * MIB, 50 * MIB, 100 * MIB).expect("the first retry fits");
+        let second = retried_reservation(first, 50 * MIB, 100 * MIB).expect("the second retry fits");
+        assert_eq!(second, 250 * MIB);
+        assert_eq!(retried_reservation(second, 50 * MIB, 100 * MIB), None, "the third would pass 256 MiB");
+        assert_eq!(retried_reservation(0, 0, MAX_IMAGE_BYTES + 1), None, "a single image over the per-image limit never fits");
+    }
+
+    #[test]
+    fn an_image_with_another_aspect_ratio_is_rejected() {
+        let image = egui::ColorImage::filled([200, 100], egui::Color32::RED);
+        let geometry = Geometry { size: egui::vec2(100.0, 60.0), pixels_per_point: 2.0, epoch: 0 };
+        assert!(screenshot_png(&image, None, geometry).is_err());
+    }
+
+    #[test]
+    fn an_outside_region_is_rejected_not_panicking() {
+        let image = egui::ColorImage::filled([20, 10], egui::Color32::RED);
+        let geometry = Geometry { size: egui::vec2(10.0, 5.0), pixels_per_point: 2.0, epoch: 0 };
+        assert!(screenshot_png(&image, Some(egui::Rect::from_min_max(egui::pos2(11.0, 6.0), egui::pos2(15.0, 9.0))), geometry).is_err());
+    }
+
+    /// A region that a shrink now cuts off is refused, not silently clamped to a smaller crop.
+    #[test]
+    fn a_region_cut_by_a_shrink_is_rejected_instead_of_cropped() {
+        let image = egui::ColorImage::filled([20, 10], egui::Color32::RED);
+        let shrunk = Geometry { size: egui::vec2(10.0, 5.0), pixels_per_point: 2.0, epoch: 0 };
+        let region = egui::Rect::from_min_max(egui::pos2(8.0, 4.0), egui::pos2(15.0, 9.0));
+        assert!(!shrunk.contains_region(region));
+        let error = screenshot_png(&image, Some(region), shrunk).expect_err("a cut region must not become a smaller image");
+        assert!(error.contains("inside the window"), "{error}");
+    }
+
+    /// Screenshot identity is the captured content, not the window's monitor-space origin or the
+    /// focused widget: only the capture epoch and the viewport-local size/scale matter.
+    #[test]
+    fn capture_geometry_compares_size_scale_and_capture_epoch_only() {
+        let admitted = Geometry { size: egui::vec2(800.0, 600.0), pixels_per_point: 2.0, epoch: 5 };
+        assert_eq!(admitted, Geometry { size: egui::vec2(800.0, 600.0), pixels_per_point: 2.0, epoch: 5 });
+        assert_ne!(admitted, Geometry { size: egui::vec2(801.0, 600.0), pixels_per_point: 2.0, epoch: 5 });
+        assert_ne!(admitted, Geometry { size: egui::vec2(800.0, 600.0), pixels_per_point: 1.5, epoch: 5 });
+        assert_ne!(admitted, Geometry { size: egui::vec2(800.0, 600.0), pixels_per_point: 2.0, epoch: 6 });
+        assert!(admitted.contains_region(egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(800.0, 600.0))));
+        assert!(!admitted.contains_region(egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(801.0, 600.0))));
+        assert!(!admitted.contains_region(egui::Rect::from_min_max(egui::pos2(-1.0, 0.0), egui::pos2(10.0, 10.0))));
+    }
+}
+
+#[cfg(test)]
 mod pointer_tests {
     use super::*;
     use egui_kittest::Harness;
@@ -1433,6 +2777,8 @@ mod pointer_tests {
         let slow_dt = (max_duration + 0.25) as f32;
         assert!(f64::from(slow_dt) > max_duration);
         for discard in [false, true] {
+            // This probe draws its own UI with the harness's fonts, not PdfCraftApp::ui.
+            // Exercise the readiness gate explicitly before allowing this host's input.
             let state = Probe {
                 control: None,
                 client: None,
@@ -1481,6 +2827,26 @@ mod pointer_tests {
             );
             h.run_steps(3);
             let c = h.state().client.as_ref().unwrap().clone();
+            let probe_pos = h.get_by_label("Click probe").rect().center();
+            let waiting = c.send("ui.click", json!({"x":probe_pos.x,"y":probe_pos.y}));
+            h.run_steps(3);
+            assert!(waiting.try_recv().is_err(), "unready host must defer control input");
+            assert_eq!(h.state().primary, 0);
+            assert!(h.state().events.is_empty());
+            h.state_mut().host.fonts_ready = true;
+            let mut ready_reply = None;
+            for _ in 0..8 {
+                h.step();
+                if let Ok(reply) = waiting.try_recv() {
+                    ready_reply = Some(reply);
+                    break;
+                }
+            }
+            assert!(ready_reply.expect("ready host completes deferred click").is_ok());
+            assert_eq!(h.state().primary, 1);
+            h.state_mut().primary = 0;
+            h.state_mut().events.clear();
+            h.state_mut().discarded = false;
             assert_eq!(h.ctx.options(|o| o.input_options.max_click_duration), max_duration);
             let pos = h.get_by_label("Click probe").rect().center();
             assert_eq!((h.state().primary, h.state().secondary, h.state().disabled), (0, 0, 0));
