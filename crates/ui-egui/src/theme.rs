@@ -702,6 +702,9 @@ mod tests {
         assert_eq!(on_interface_baseline(FontData::from_static(dancing)).tweak.fallback_align, FallbackAlign::Baseline);
     }
 
+    /// The policy only exists on native platforms (`installed_font_definitions` has no installed
+    /// faces on wasm), so the test must not use it in a wasm test build.
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn traditional_chinese_keeps_an_installed_face_when_hans_is_embedded() {
         use crate::system_fonts::Need;

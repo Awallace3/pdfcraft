@@ -304,6 +304,17 @@ fn picker_text_is_drawable(ui: &egui::Ui, text: &str) -> bool {
     }
 }
 
+/// The date picker's displayed name. Its languages are the interface languages, so it uses the
+/// same drawable-name fallback: a native name whose script this build has no face for would
+/// otherwise abort under egui 0.37's `MissingGlyphPolicy::Panic` (for example Hindi without a
+/// Devanagari face and installed system fonts turned off).
+fn date_language_picker_name(l: &pdfcraft_engine::dates::DateLanguage, drawable: impl FnOnce(&str) -> bool) -> &'static str {
+    match crate::i18n::Lang::from_code(l.code) {
+        Some(language) => language.picker_name(drawable),
+        None => l.name,
+    }
+}
+
 /// Preferences: interface language and size, appearance, identity and JavaScript. Drawn in a scroll
 /// area; [`preferences_buttons`] goes below it, outside the scroll, so OK is always in reach.
 pub(crate) fn preferences_body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
@@ -634,10 +645,20 @@ fn date_format(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
     }
     ui.horizontal(|ui| {
         let label = ui.label(tl!("Language"));
-        let interface = crate::i18n::current().name();
-        let follow = crate::i18n::fmt(tl!("Same as interface ({language})"), &[("language", interface)]);
-        let current = app.session.date_language().map(str::to_string);
-        let selected = DATE_LANGUAGES.iter().find(|l| current.as_deref() == Some(l.code)).map_or(follow.clone(), |l| l.name.to_string());
+        // Build every label before the combo box mutably borrows `ui`, with the same drawable
+        // fallback the interface language picker uses.
+        let (follow, selected, current, names) = {
+            let drawable = |text: &str| picker_text_is_drawable(ui, text);
+            let interface = crate::i18n::current().picker_name(drawable);
+            let follow = crate::i18n::fmt(tl!("Same as interface ({language})"), &[("language", interface)]);
+            let current = app.session.date_language().map(str::to_string);
+            let selected = DATE_LANGUAGES
+                .iter()
+                .find(|l| current.as_deref() == Some(l.code))
+                .map_or_else(|| follow.clone(), |l| date_language_picker_name(l, drawable).to_string());
+            let names = DATE_LANGUAGES.iter().map(|l| (l, date_language_picker_name(l, drawable))).collect::<Vec<_>>();
+            (follow, selected, current, names)
+        };
         egui::ComboBox::from_id_salt("date-language")
             .selected_text(selected)
             .width(240.0)
@@ -645,9 +666,8 @@ fn date_format(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
                 if ui.selectable_label(current.is_none(), follow).clicked() && app.session.set_date_language(None).is_ok() {
                     ui.close();
                 }
-                for l in &DATE_LANGUAGES {
-                    if ui.selectable_label(current.as_deref() == Some(l.code), l.name).clicked()
-                        && app.session.set_date_language(Some(l.code)).is_ok()
+                for (l, name) in &names {
+                    if ui.selectable_label(current.as_deref() == Some(l.code), *name).clicked() && app.session.set_date_language(Some(l.code)).is_ok()
                     {
                         ui.close();
                     }
@@ -664,4 +684,22 @@ fn date_format(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
         .small()
         .color(t.text_muted),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn date_language_names_fall_back_when_the_native_name_cannot_be_drawn() {
+        let date_language = |code: &str| pdfcraft_engine::dates::DATE_LANGUAGES.iter().find(|l| l.code == code).expect("date language");
+        let hindi = date_language("hi");
+        assert_eq!(date_language_picker_name(hindi, |_| true), hindi.name, "the native name is kept when it can be drawn");
+        assert_eq!(date_language_picker_name(hindi, |_| false), "Hindi", "no Devanagari face: show the English name");
+        let chinese = date_language("zh-hans");
+        assert_eq!(date_language_picker_name(chinese, |_| false), "Simplified Chinese");
+        for language in &pdfcraft_engine::dates::DATE_LANGUAGES {
+            assert!(!date_language_picker_name(language, |_| false).is_empty(), "{}", language.code);
+        }
+    }
 }

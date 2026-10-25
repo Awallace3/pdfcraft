@@ -68,6 +68,18 @@ fn not_drawn(what: &str) -> String {
     )
 }
 
+fn still_starting() -> String {
+    format!("the app was still starting after {NOT_DRAWN_TIMEOUT:.0} s; the control request was not applied, retry when the window is drawn")
+}
+
+/// The app finished starting, but only after this request's one admission deadline had already
+/// passed. Report that instead of claiming the app is still starting.
+fn startup_deadline_expired() -> String {
+    format!(
+        "the app finished starting after this control request's {NOT_DRAWN_TIMEOUT:.0} s deadline; the request was not applied, retry now that the window is drawn"
+    )
+}
+
 /// One request from a client, answered on `reply`.
 pub struct ControlRequest {
     pub method: String,
@@ -374,13 +386,23 @@ enum Pending {
     },
 }
 
+/// A request that arrived while the app could not yet run a real UI pass (fonts not ready).
+struct DeferredRequest {
+    request: ControlRequest,
+    /// When this request reached the control queue. One admission deadline runs from here through
+    /// startup, input injection, pending frames and screenshot issuance: dispatching it later must
+    /// not start a fresh 5 s in each phase, and a request that used up the deadline while the app
+    /// was starting is never applied against a later UI state.
+    since: web_time::Instant,
+}
+
 /// The app half: the request queue and requests waiting for later frames.
 pub struct Control {
     rx: Receiver<ControlRequest>,
     shared: Arc<Mutex<Shared>>,
     pending: Vec<Pending>,
     /// Requests admitted while the app cannot yet run a real UI pass (fonts not ready).
-    deferred: VecDeque<ControlRequest>,
+    deferred: VecDeque<DeferredRequest>,
 }
 
 /// Install the control channel on `ctx`: returns the app half and a client.
@@ -432,21 +454,41 @@ impl Control {
         self.set_epoch(host.input_epoch());
         self.finish_pending(ctx, host);
         let ready = host.accepts_input();
+        if !ready {
+            // Expiry applies while the app is still starting too: a request that waited through
+            // the startup gate must fail at the same deadline instead of running whenever fonts
+            // arrive.
+            let now = web_time::Instant::now();
+            while self.deferred.front().is_some_and(|deferred| now.duration_since(deferred.since) > timeout()) {
+                if let Some(deferred) = self.deferred.pop_front() {
+                    let _ = deferred.request.reply.send(Err(still_starting()));
+                }
+            }
+        } else {
+            // Deferred requests reached the queue before anything still in the channel, so they
+            // are dispatched first: one client's requests keep their arrival order. Each carries
+            // its own admission timestamp, so startup time counts against its deadline.
+            while let Some(deferred) = self.deferred.pop_front() {
+                if web_time::Instant::now().duration_since(deferred.since) > timeout() {
+                    let _ = deferred.request.reply.send(Err(startup_deadline_expired()));
+                } else {
+                    self.dispatch(ctx, host, deferred.request, deferred.since);
+                }
+            }
+        }
         while let Ok(req) = self.rx.try_recv() {
+            // One admission timestamp per request: queued input, pending frames and an admitted
+            // screenshot all measure their deadline from this arrival, never from a later phase.
+            let since = web_time::Instant::now();
             if !ready {
                 if self.deferred.len() < 32 {
-                    self.deferred.push_back(req);
+                    self.deferred.push_back(DeferredRequest { request: req, since });
                 } else {
                     let _ = req.reply.send(Err("the app is still starting; too many control requests queued".into()));
                 }
                 continue;
             }
-            self.dispatch(ctx, host, req);
-        }
-        if ready {
-            while let Some(req) = self.deferred.pop_front() {
-                self.dispatch(ctx, host, req);
-            }
+            self.dispatch(ctx, host, req, since);
         }
         if !self.pending.is_empty() || !self.deferred.is_empty() {
             ctx.request_repaint();
@@ -551,20 +593,21 @@ impl Control {
         }
     }
 
-    fn dispatch(&mut self, ctx: &egui::Context, host: &mut impl Host, req: ControlRequest) {
-        match self.handle(ctx, host, &req.method, &req.params) {
+    /// `since` is the request's arrival time: the one admission deadline it was admitted under.
+    fn dispatch(&mut self, ctx: &egui::Context, host: &mut impl Host, req: ControlRequest, since: web_time::Instant) {
+        match self.handle(ctx, host, &req.method, &req.params, since) {
             Handled::Now(r) => {
                 let _ = req.reply.send(r);
             }
             Handled::AfterFrames(frames, value) => {
                 let until_pass = self.passes() + u64::from(frames);
-                self.pending.push(Pending::Frames { until_pass, batches: Vec::new(), since: web_time::Instant::now(), reply: req.reply, value });
+                self.pending.push(Pending::Frames { until_pass, batches: Vec::new(), since, reply: req.reply, value });
             }
             Handled::AfterInput { batches, frames, value } => {
                 let until_pass = self.passes() + u64::from(frames) + 1;
-                self.pending.push(Pending::Frames { until_pass, batches, since: web_time::Instant::now(), reply: req.reply, value });
+                self.pending.push(Pending::Frames { until_pass, batches, since, reply: req.reply, value });
             }
-            Handled::Screenshot(region) => self.admit_screenshot(ctx, host, region, req.reply),
+            Handled::Screenshot(region) => self.admit_screenshot(ctx, host, region, req.reply, since),
         }
     }
 
@@ -580,7 +623,14 @@ impl Control {
     }
 
     /// Admit one screenshot request within the count, per-image and aggregate limits.
-    fn admit_screenshot(&mut self, ctx: &egui::Context, host: &mut impl Host, region: Option<egui::Rect>, reply: Sender<Reply>) {
+    fn admit_screenshot(
+        &mut self,
+        ctx: &egui::Context,
+        host: &mut impl Host,
+        region: Option<egui::Rect>,
+        reply: Sender<Reply>,
+        since: web_time::Instant,
+    ) {
         if self.pending_screenshots() >= MAX_PENDING_SCREENSHOTS {
             let _ = reply.send(Err(format!("too many screenshots are already pending (limit {MAX_PENDING_SCREENSHOTS})")));
             return;
@@ -605,16 +655,7 @@ impl Control {
             return;
         }
         let (slot, callback) = craft_ui::capture::CaptureSlot::new(ctx, egui::ViewportId::ROOT, MAX_IMAGE_BYTES);
-        self.pending.push(Pending::Screenshot {
-            slot,
-            callback: Some(callback),
-            region,
-            reply,
-            since: web_time::Instant::now(),
-            geometry,
-            reserved: bytes,
-            attempts: 0,
-        });
+        self.pending.push(Pending::Screenshot { slot, callback: Some(callback), region, reply, since, geometry, reserved: bytes, attempts: 0 });
     }
 
     fn finish_pending(&mut self, ctx: &egui::Context, host: &mut impl Host) {
@@ -733,9 +774,10 @@ impl Control {
     /// Queue one request's event batches (one per UI pass) and return its request id.
     ///
     /// The request is stamped once, at admission: all of its batches share the input-target
-    /// generation. A poisoned mutex or a full queue is an error, never a silently empty queue
-    /// that would let the caller answer `Ok` for input that never happened.
-    fn inject(&self, batches: Vec<Vec<egui::Event>>) -> Result<Vec<u64>, String> {
+    /// generation and the caller's single arrival deadline (`since`), so a deferred startup wait
+    /// is not restarted here. A poisoned mutex or a full queue is an error, never a silently empty
+    /// queue that would let the caller answer `Ok` for input that never happened.
+    fn inject(&self, batches: Vec<Vec<egui::Event>>, since: web_time::Instant) -> Result<Vec<u64>, String> {
         let mut s = self.shared.lock().map_err(|_| "control state poisoned".to_string())?;
         let queued: usize = s.inject.iter().map(|request| request.batches.len()).sum();
         if queued.saturating_add(batches.len()) > MAX_QUEUED_BATCHES {
@@ -744,24 +786,17 @@ impl Control {
         s.next_batch += 1;
         let id = s.next_batch;
         let epoch = s.epoch;
-        s.inject.push_back(RequestBatches {
-            request: id,
-            epoch,
-            started: false,
-            since: web_time::Instant::now(),
-            release: Vec::new(),
-            batches: batches.into(),
-        });
+        s.inject.push_back(RequestBatches { request: id, epoch, started: false, since, release: Vec::new(), batches: batches.into() });
         Ok(vec![id])
     }
 
-    fn after_input(&self, batches: Vec<Vec<egui::Event>>, value: Value) -> Result<Handled, String> {
+    fn after_input(&self, batches: Vec<Vec<egui::Event>>, value: Value, since: web_time::Instant) -> Result<Handled, String> {
         let frames = batches.len() as u32;
-        let batches = self.inject(batches)?;
+        let batches = self.inject(batches, since)?;
         Ok(Handled::AfterInput { batches, frames, value })
     }
 
-    fn handle(&mut self, ctx: &egui::Context, host: &mut impl Host, method: &str, p: &Value) -> Handled {
+    fn handle(&mut self, ctx: &egui::Context, host: &mut impl Host, method: &str, p: &Value, since: web_time::Instant) -> Handled {
         let str_param = |k: &str| p.get(k).and_then(Value::as_str).ok_or_else(|| format!("{method}: missing string parameter {k}"));
         let r: Result<Handled, String> = (|| match method {
             "ui.state" => {
@@ -786,8 +821,8 @@ impl Control {
             }
             "ui.open" => Ok(Handled::Now(host.open(str_param("path")?))),
             "ui.inspect" => Ok(Handled::Now(Ok(self.inspect(p)))),
-            "ui.click" => self.click(p),
-            "ui.focus" => self.focus(p),
+            "ui.click" => self.click(p, since),
+            "ui.focus" => self.focus(p, since),
             "ui.resize" => {
                 only_params(p, method, &["width", "height"])?;
                 let dimension = |key: &str| -> Result<f32, String> {
@@ -813,7 +848,7 @@ impl Control {
                 let quitting = host.quit(ctx);
                 Ok(Handled::Now(Ok(json!({ "quitting": quitting, "needs_confirmation": !quitting }))))
             }
-            "ui.drag" => self.drag(p),
+            "ui.drag" => self.drag(p, since),
             "ui.move" => {
                 let point = |key: &str| -> Result<f32, String> {
                     p.get(key)
@@ -823,18 +858,18 @@ impl Control {
                         .ok_or_else(|| format!("ui.move: {key} must be a finite coordinate in points"))
                 };
                 let pos = egui::pos2(point("x")?, point("y")?);
-                self.after_input(vec![vec![egui::Event::PointerMoved(pos)]], json!({ "moved": [pos.x, pos.y] }))
+                self.after_input(vec![vec![egui::Event::PointerMoved(pos)]], json!({ "moved": [pos.x, pos.y] }), since)
             }
             "ui.type" => {
                 let text = str_param("text")?.to_string();
-                self.after_input(vec![vec![egui::Event::Text(text)]], json!({ "typed": true }))
+                self.after_input(vec![vec![egui::Event::Text(text)]], json!({ "typed": true }), since)
             }
             "ui.key" => {
                 let name = str_param("key")?;
                 let key = egui::Key::from_name(name)
                     .ok_or_else(|| format!("ui.key: unknown key {name:?} (egui key names: A, Enter, Escape, ArrowDown, F5, …)"))?;
                 let modifiers = modifiers(p.get("modifiers"))?;
-                self.after_input(key_batches(key, modifiers), json!({ "key": name }))
+                self.after_input(key_batches(key, modifiers), json!({ "key": name }), since)
             }
             "ui.screenshot" => {
                 let region = match p.get("region") {
@@ -883,7 +918,7 @@ impl Control {
     }
 
     /// Press at `from`, move to `to` in `steps` frames, release (drawing, selecting text, moving).
-    fn drag(&mut self, p: &Value) -> Result<Handled, String> {
+    fn drag(&mut self, p: &Value, since: web_time::Instant) -> Result<Handled, String> {
         let point = |k: &str| -> Result<egui::Pos2, String> {
             match p.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_f64).collect::<Vec<_>>()).as_deref() {
                 Some([x, y]) => Some(egui::pos2(*x as f32, *y as f32))
@@ -916,10 +951,10 @@ impl Control {
         if modifiers != egui::Modifiers::NONE {
             frames.push(vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
         }
-        self.after_input(frames, json!({ "dragged": [[from.x, from.y], [to.x, to.y]] }))
+        self.after_input(frames, json!({ "dragged": [[from.x, from.y], [to.x, to.y]] }), since)
     }
 
-    fn click(&mut self, p: &Value) -> Result<Handled, String> {
+    fn click(&mut self, p: &Value, since: web_time::Instant) -> Result<Handled, String> {
         if let (Some(x), Some(y)) = (p.get("x").and_then(Value::as_f64), p.get("y").and_then(Value::as_f64)) {
             let point = |key: &str, n: f64| {
                 Some(n as f32).filter(|n| n.is_finite()).ok_or_else(|| format!("ui.click: {key} must be a finite coordinate in points"))
@@ -929,7 +964,7 @@ impl Control {
             let button = |pressed| egui::Event::PointerButton { pos, button: which, pressed, modifiers: egui::Modifiers::NONE };
             // Keep hover/layout warmup, then make an instantaneous click even on slow frames.
             let frames = vec![vec![egui::Event::PointerMoved(pos)], vec![button(true), button(false)]];
-            return self.after_input(frames, json!({ "clicked": [x, y] }));
+            return self.after_input(frames, json!({ "clicked": [x, y] }), since);
         }
         let s = self.shared.lock().map_err(|_| "control state poisoned")?;
         let id = match (p.get("id"), p.get("label").and_then(Value::as_str)) {
@@ -966,10 +1001,10 @@ impl Control {
         let action = accesskit::ActionRequest { action: Action::Click, target_tree: accesskit::TreeId::ROOT, target_node: id, data: None };
         drop(s);
         let frames = vec![vec![egui::Event::AccessKitActionRequest(action)]];
-        self.after_input(frames, json!({ "clicked": id.0.to_string(), "label": label }))
+        self.after_input(frames, json!({ "clicked": id.0.to_string(), "label": label }), since)
     }
 
-    fn focus(&mut self, p: &Value) -> Result<Handled, String> {
+    fn focus(&mut self, p: &Value, since: web_time::Instant) -> Result<Handled, String> {
         only_params(p, "ui.focus", &["id", "label"])?;
         let s = self.shared.lock().map_err(|_| "control state poisoned")?;
         let id = match (p.get("id"), p.get("label")) {
@@ -998,7 +1033,7 @@ impl Control {
         let action = accesskit::ActionRequest { action: Action::Focus, target_tree: accesskit::TreeId::ROOT, target_node: id, data: None };
         drop(s);
         let frames = vec![vec![egui::Event::AccessKitActionRequest(action)]];
-        self.after_input(frames, json!({ "focus_requested": id.0.to_string() }))
+        self.after_input(frames, json!({ "focus_requested": id.0.to_string() }), since)
     }
 }
 
@@ -2214,6 +2249,201 @@ mod lifecycle_tests {
         }
     }
 
+    /// A host that starts unready (fonts not installed) and counts dispatched state reads.
+    /// `state` takes `&self`, so the count sits in a `Cell`.
+    struct ReadinessHost {
+        ready: bool,
+        states: std::cell::Cell<usize>,
+        /// Methods the host was asked to run, in dispatch order.
+        calls: std::cell::RefCell<Vec<&'static str>>,
+    }
+
+    impl ReadinessHost {
+        fn new(ready: bool) -> Self {
+            Self { ready, states: std::cell::Cell::new(0), calls: std::cell::RefCell::new(Vec::new()) }
+        }
+    }
+
+    impl Host for ReadinessHost {
+        fn state(&self) -> Value {
+            self.states.set(self.states.get() + 1);
+            self.calls.borrow_mut().push("ui.state");
+            json!({ "ready": self.ready })
+        }
+        fn command(&mut self, _id: &str) -> Reply {
+            Err("no commands in this test".into())
+        }
+        fn dock(&mut self, _reset: bool, _params: &Value) -> Reply {
+            Err("no docking in this test".into())
+        }
+        fn commands(&self) -> Value {
+            self.calls.borrow_mut().push("ui.commands");
+            json!([])
+        }
+        fn set(&mut self, _key: &str, _value: &str) -> Reply {
+            Err("no settings in this test".into())
+        }
+        fn open(&mut self, _path: &str) -> Reply {
+            Err("no files in this test".into())
+        }
+        fn quit(&mut self, _ctx: &egui::Context) -> bool {
+            false
+        }
+        fn accepts_input(&self) -> bool {
+            self.ready
+        }
+    }
+
+    /// The admission timestamp of the one pending request, whichever kind it is.
+    fn pending_since(control: &Control) -> Option<web_time::Instant> {
+        let first = control.pending.first()?;
+        match first {
+            Pending::Frames { since, .. } | Pending::Screenshot { since, .. } => Some(*since),
+        }
+    }
+
+    /// A request held during startup keeps its arrival time. Once the app accepts input, one
+    /// older than the control deadline fails instead of being dispatched into a later UI.
+    #[test]
+    fn a_deferred_request_expires_instead_of_dispatching_after_the_deadline() {
+        let ctx = egui::Context::default();
+        let (mut control, client) = attach(&ctx);
+        let mut host = ReadinessHost::new(false);
+        let waiting = client.send("ui.state", json!({}));
+        control.tick(&ctx, &mut host);
+        assert_eq!(control.deferred.len(), 1, "unready host defers the request");
+        assert!(waiting.try_recv().is_err(), "it is not answered while starting");
+        let past = web_time::Instant::now().checked_sub(std::time::Duration::from_secs(10)).unwrap();
+        for deferred in &mut control.deferred {
+            deferred.since = past;
+        }
+        // It expires even while the app is still not ready, so the client is not left waiting.
+        control.tick(&ctx, &mut host);
+        let error = waiting.try_recv().expect("expired deferred request receives a reply").expect_err("it must not dispatch");
+        assert!(error.contains("still starting"), "{error}");
+        assert!(control.deferred.is_empty());
+        // And readiness arriving later cannot revive it.
+        host.ready = true;
+        control.tick(&ctx, &mut host);
+        assert_eq!(host.states.get(), 0, "an expired request is never dispatched");
+    }
+
+    /// A request deferred only briefly still runs once fonts are ready.
+    #[test]
+    fn a_fresh_deferred_request_still_dispatches_when_the_app_becomes_ready() {
+        let ctx = egui::Context::default();
+        let (mut control, client) = attach(&ctx);
+        let mut host = ReadinessHost::new(false);
+        let waiting = client.send("ui.state", json!({}));
+        control.tick(&ctx, &mut host);
+        assert!(waiting.try_recv().is_err());
+        host.ready = true;
+        control.tick(&ctx, &mut host);
+        let reply = waiting.try_recv().expect("fresh deferred request replies").expect("it dispatches");
+        assert_eq!(reply["ready"], true);
+        assert_eq!(host.states.get(), 1, "the fresh deferred request is dispatched once");
+    }
+
+    /// A request deferred during startup keeps its one arrival timestamp. Dispatching it into
+    /// synthetic input, a deferred frame reply or a screenshot reservation must not start a fresh
+    /// 5 s in that phase: every later phase measures the same deadline from arrival.
+    #[test]
+    fn a_startup_wait_counts_against_one_admission_deadline_in_every_phase() {
+        let params = [("ui.type", json!({ "text": "x" })), ("ui.resize", json!({ "width": 800, "height": 600 })), ("ui.screenshot", json!({}))];
+        for (method, params) in params {
+            // `ui.resize` needs a native window; the other phases are checked on every target.
+            if method == "ui.resize" && cfg!(target_arch = "wasm32") {
+                continue;
+            }
+            let ctx = egui::Context::default();
+            // A real window size, so an admitted screenshot has capturable geometry.
+            ctx.run_ui(
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0))), ..Default::default() },
+                |_| {},
+            )
+            .drop_without_applying_deltas();
+            let (mut control, client) = attach(&ctx);
+            let mut host = ReadinessHost::new(false);
+            let waiting = client.send(method, params);
+            control.tick(&ctx, &mut host);
+            assert_eq!(control.deferred.len(), 1, "{method}: deferred while starting");
+            // Three of the five seconds were spent starting: the request is still inside its
+            // deadline, but only just.
+            let arrived = web_time::Instant::now().checked_sub(std::time::Duration::from_secs(3)).unwrap();
+            for deferred in &mut control.deferred {
+                deferred.since = arrived;
+            }
+            host.ready = true;
+            control.tick(&ctx, &mut host);
+            assert!(control.deferred.is_empty(), "{method}: dispatched once the app accepts input");
+            assert!(waiting.try_recv().is_err(), "{method}: a preserved deadline does not answer early");
+            assert_eq!(pending_since(&control), Some(arrived), "{method}: the pending reply keeps the arrival deadline");
+            if method == "ui.type" {
+                let shared = control.shared.lock().unwrap();
+                assert_eq!(shared.inject.front().map(|request| request.since), Some(arrived), "{method}: queued input keeps the arrival deadline");
+            }
+            // Move that same shared timestamp past its own deadline (five seconds after arrival).
+            // Expiry measures the one admission instant, so nothing waits for a fresh five.
+            let past = arrived.checked_sub(timeout()).expect("a representable instant");
+            for pending in &mut control.pending {
+                match pending {
+                    Pending::Frames { since, .. } | Pending::Screenshot { since, .. } => *since = past,
+                }
+            }
+            if let Ok(mut shared) = control.shared.lock() {
+                for request in &mut shared.inject {
+                    request.since = past;
+                }
+            }
+            control.finish_pending(&ctx, &mut host);
+            let error = waiting.try_recv().expect("the expired request replies").expect_err("it must not succeed");
+            assert!(error.contains("not being drawn"), "{method}: {error}");
+            assert!(control.pending.is_empty(), "{method}: the expired request is not retried");
+            assert_eq!(control.reserved_bytes(), 0, "{method}: any reservation is released");
+        }
+    }
+
+    /// One client's requests keep their arrival order: a request deferred during startup runs
+    /// before a newer request that was still waiting in the channel when the app became ready.
+    #[test]
+    fn a_deferred_request_runs_before_a_newer_queued_one() {
+        let ctx = egui::Context::default();
+        let (mut control, client) = attach(&ctx);
+        let mut host = ReadinessHost::new(false);
+        let older = client.send("ui.state", json!({}));
+        control.tick(&ctx, &mut host);
+        assert_eq!(control.deferred.len(), 1, "the older request is deferred while starting");
+        let newer = client.send("ui.commands", json!({}));
+        host.ready = true;
+        control.tick(&ctx, &mut host);
+        assert_eq!(*host.calls.borrow(), ["ui.state", "ui.commands"], "the older deferred request is dispatched first");
+        assert_eq!(older.try_recv().expect("the older request replies").expect("it dispatches")["ready"], true);
+        assert_eq!(newer.try_recv().expect("the newer request replies").expect("it dispatches"), json!([]));
+    }
+
+    /// A request whose startup wait used up the deadline is refused once the app is ready, and the
+    /// message says the app finished starting instead of claiming it is still starting.
+    #[test]
+    fn a_request_that_outlasted_startup_reports_that_the_app_finished_starting() {
+        let ctx = egui::Context::default();
+        let (mut control, client) = attach(&ctx);
+        let mut host = ReadinessHost::new(false);
+        let waiting = client.send("ui.state", json!({}));
+        control.tick(&ctx, &mut host);
+        assert_eq!(control.deferred.len(), 1);
+        let past = web_time::Instant::now().checked_sub(std::time::Duration::from_secs(10)).unwrap();
+        for deferred in &mut control.deferred {
+            deferred.since = past;
+        }
+        host.ready = true;
+        control.tick(&ctx, &mut host);
+        let error = waiting.try_recv().expect("the expired request replies").expect_err("it is never dispatched");
+        assert!(error.contains("finished starting"), "{error}");
+        assert!(!error.contains("was still starting"), "the app is ready now: {error}");
+        assert_eq!(host.states.get(), 0, "an expired request is never dispatched");
+        assert!(control.deferred.is_empty() && control.pending.is_empty());
+    }
+
     /// Keep key/modifier cleanup, but a canceled pointer must never produce a release event.
     #[test]
     fn a_timed_out_started_request_cancels_pointer_and_releases_keys() {
@@ -2223,16 +2453,19 @@ mod lifecycle_tests {
         let pos = egui::pos2(24.0, 32.0);
         let key = |pressed| egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed, repeat: false, modifiers: held };
         let ids = control
-            .inject(vec![
+            .inject(
                 vec![
-                    egui::Event::ModifiersChanged(held),
-                    key(true),
-                    egui::Event::PointerMoved(pos),
-                    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: held },
+                    vec![
+                        egui::Event::ModifiersChanged(held),
+                        key(true),
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: held },
+                    ],
+                    vec![egui::Event::PointerMoved(egui::pos2(40.0, 48.0))],
+                    vec![key(false), egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: held }],
                 ],
-                vec![egui::Event::PointerMoved(egui::pos2(40.0, 48.0))],
-                vec![key(false), egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: held }],
-            ])
+                web_time::Instant::now(),
+            )
             .unwrap();
         let (reply, rx) = channel();
         control.pending.push(Pending::Frames { until_pass: u64::MAX, batches: ids, since: web_time::Instant::now(), reply, value: json!({}) });
@@ -2241,7 +2474,7 @@ mod lifecycle_tests {
         assert_eq!(ctx.input(|i| i.modifiers), held);
         age_input(&mut control);
         let next = egui::pos2(80.0, 90.0);
-        control.inject(vec![vec![egui::Event::PointerMoved(next)]]).unwrap();
+        control.inject(vec![vec![egui::Event::PointerMoved(next)]], web_time::Instant::now()).unwrap();
         control.finish_pending(&ctx, &mut NoopHost);
         assert!(rx.try_recv().unwrap().unwrap_err().contains("not being drawn"));
         assert!(control.pending.is_empty());
@@ -2263,13 +2496,16 @@ mod lifecycle_tests {
         let (mut control, _client) = attach(&ctx);
         let pos = egui::pos2(24.0, 32.0);
         let ids = control
-            .inject(vec![
+            .inject(
                 vec![
-                    egui::Event::PointerMoved(pos),
-                    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+                    ],
+                    vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }],
                 ],
-                vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }],
-            ])
+                web_time::Instant::now(),
+            )
             .unwrap();
         let (reply, rx) = channel();
         control.pending.push(Pending::Frames { until_pass: u64::MAX, batches: ids, since: web_time::Instant::now(), reply, value: json!({}) });

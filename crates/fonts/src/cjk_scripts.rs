@@ -23,6 +23,13 @@ pub fn is_cjk_script(tag: &str) -> bool {
     CJK_SCRIPTS.contains(&code)
 }
 
+/// Whether a manifest's comma-separated script list contains `script` exactly, ignoring spaces.
+/// The interface and document lookups use exact tags (`CraftFont::covers`), so a regional tag
+/// such as `Hans-HK` is not a `Hans` entry.
+pub fn has_script_tag(scripts: &str, script: &str) -> bool {
+    scripts.split(',').any(|tag| tag.trim() == script)
+}
+
 /// What `build.rs` does with one CJK face from a manifest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CjkSizeDecision {
@@ -60,6 +67,15 @@ pub fn cjk_size_decision(family: &str, bytes: u64, wasm: bool, required: bool) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_required_chinese_manifest_needs_an_exact_hans_entry() {
+        assert!(has_script_tag("Hans,Latn", "Hans"));
+        assert!(has_script_tag(" Latn , Hans ", "Hans"));
+        assert!(!has_script_tag("Hant,Latn", "Hans"), "Traditional Chinese is not the required Simplified face");
+        assert!(!has_script_tag("Hans-HK,Latn", "Hans"), "the UI looks for the exact Hans tag");
+        assert!(!has_script_tag("Hani,Jpan,Kore", "Hans"));
+    }
 
     #[test]
     fn a_required_native_chinese_face_over_its_cap_is_rejected_not_skipped() {
