@@ -8,7 +8,8 @@ param(
   [Parameter(Mandatory)] [string] $Path,
   # 1 when package.ps1 staged craft-fonts OFL notices, 0 when the binaries embed no craft-fonts.
   # -1 (the default) skips the check when the MSI is inspected by hand.
-  [int] $CraftFontLicences = -1
+  [int] $CraftFontLicences = -1,
+  [string] $ExpectedFontNoticesDirectory
 )
 $ErrorActionPreference = 'Stop'
 $Installer = New-Object -ComObject WindowsInstaller.Installer
@@ -92,6 +93,11 @@ if ($CraftFontLicences -eq 1 -and $fontNotices.Count -eq 0) {
 }
 if ($CraftFontLicences -eq 0 -and $fontNotices.Count -gt 0) {
   throw "the MSI carries craft-font notices that packaging did not stage: $($fontNotices -join ', ')"
+}
+if ($ExpectedFontNoticesDirectory) {
+  . (Join-Path $PSScriptRoot 'font-notices.ps1')
+  $expected = @(Get-ChildItem -LiteralPath $ExpectedFontNoticesDirectory -File -Filter 'OFL-*.txt' | ForEach-Object { $_.Name })
+  Assert-CraftFontNoticeNames $expected $fontNotices
 }
 $status = Read-Row 'SELECT `Text` FROM `Control` WHERE `Dialog_` = ''InstallProgress'' AND `Control` = ''Status''' 1
 Assert-Equal $status[0] 'Please wait while setup completes.' 'Persistent progress message'

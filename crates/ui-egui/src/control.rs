@@ -82,6 +82,8 @@ fn startup_deadline_expired() -> String {
 
 /// One request from a client, answered on `reply`.
 pub struct ControlRequest {
+    /// Admission time on the sending thread, including time waiting for the next app tick.
+    pub since: web_time::Instant,
     pub method: String,
     pub params: Value,
     pub reply: Sender<Reply>,
@@ -98,7 +100,7 @@ impl ControlClient {
     /// Queue a request; the reply arrives on the returned receiver once the app has handled it.
     pub fn send(&self, method: &str, params: Value) -> Receiver<Reply> {
         let (reply, rx) = channel();
-        let req = ControlRequest { method: method.into(), params, reply };
+        let req = ControlRequest { since: web_time::Instant::now(), method: method.into(), params, reply };
         if let Err(e) = self.tx.send(req) {
             let _ = e.0.reply.send(Err("the app has closed".into()));
         }
@@ -620,8 +622,13 @@ impl Control {
         }
         while let Ok(req) = self.rx.try_recv() {
             // One admission timestamp per request: queued input, pending frames and an admitted
-            // screenshot all measure their deadline from this arrival, never from a later phase.
-            let since = web_time::Instant::now();
+            // screenshot all measure their deadline from the sending thread, including time
+            // waiting in this channel, never from a later phase.
+            let since = req.since;
+            if web_time::Instant::now().duration_since(since) > timeout() {
+                let _ = req.reply.send(Err(if ready { startup_deadline_expired() } else { still_starting() }));
+                continue;
+            }
             if !ready {
                 if self.deferred.len() < 32 {
                     self.deferred.push_back(DeferredRequest { request: req, since });
@@ -2381,6 +2388,23 @@ mod lifecycle_tests {
         let first = control.pending.first()?;
         match first {
             Pending::Frames { since, .. } | Pending::Screenshot { since, .. } => Some(*since),
+        }
+    }
+
+    #[test]
+    fn a_request_expired_in_the_channel_is_never_dispatched_or_deferred() {
+        for ready in [false, true] {
+            let ctx = egui::Context::default();
+            let (mut control, client) = attach(&ctx);
+            let mut host = ReadinessHost::new(ready);
+            let (reply, waiting) = channel();
+            let since = web_time::Instant::now().checked_sub(std::time::Duration::from_secs(10)).unwrap();
+            client.tx.send(ControlRequest { since, method: "ui.state".into(), params: json!({}), reply }).unwrap();
+            control.tick(&ctx, &mut host);
+            let error = waiting.try_recv().expect("expired channel request replies on the first tick").expect_err("expired request cannot dispatch");
+            assert!(error.contains(if ready { "finished starting" } else { "still starting" }), "{error}");
+            assert_eq!(host.states.get(), 0);
+            assert!(control.deferred.is_empty() && control.pending.is_empty());
         }
     }
 

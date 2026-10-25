@@ -128,14 +128,13 @@ $Docs = Join-Path $Stage 'font-licences'
 New-Item -ItemType Directory -Force -Path $Docs | Out-Null
 $HasCraftFontLicences = 0
 if ($env:CRAFT_FONTS_DIR) {
-  foreach ($ofl in Get-ChildItem -Path (Join-Path $env:CRAFT_FONTS_DIR 'fonts\*\OFL.txt') -File -ErrorAction SilentlyContinue) {
+  . (Join-Path $PSScriptRoot 'font-notices.ps1')
+  # Validate both native manifests before copying anything. One family's notice cannot
+  # stand in for another's; retain complete files, including copyright and reserved names.
+  $fontNotices = @(Get-CraftFontNotices $env:CRAFT_FONTS_DIR (Test-Path Env:CRAFT_FONTS_REQUIRED))
+  foreach ($ofl in $fontNotices) {
     Copy-Item -LiteralPath $ofl.FullName -Destination (Join-Path $Docs "OFL-$($ofl.Directory.Name).txt")
     $HasCraftFontLicences = 1
-  }
-  # CRAFT_FONTS_DIR means the build embeds its faces; packaging without their notices would be
-  # a licence omission. Fail instead of silently shipping HasCraftFontLicences=0.
-  if ($HasCraftFontLicences -ne 1) {
-    throw "CRAFT_FONTS_DIR=$env:CRAFT_FONTS_DIR has no fonts\<family>\OFL.txt; refusing to package embedded craft-fonts without their licence notices"
   }
 }
 # ---- end font notices for the MSI --------------------------------------------------------------
@@ -151,7 +150,10 @@ Invoke-Native 'wix build' {
 }
 # Inspect the built MSI, not just the XML, before signing/publishing it. In a child process, so
 # its Windows Installer database handle is gone before signtool opens the MSI.
-Invoke-Native 'test-msi' { & (Get-Process -Id $PID).Path -NoProfile -File (Join-Path $PSScriptRoot 'test-msi.ps1') $Msi -CraftFontLicences $HasCraftFontLicences }
+Invoke-Native 'test-msi' {
+  & (Get-Process -Id $PID).Path -NoProfile -File (Join-Path $PSScriptRoot 'test-msi.ps1') $Msi `
+    -CraftFontLicences $HasCraftFontLicences -ExpectedFontNoticesDirectory $Docs
+}
 # wix writes its debug symbols (.wixpdb) next to the MSI; keep them out of the release assets.
 Remove-Item -Force -ErrorAction SilentlyContinue ([IO.Path]::ChangeExtension($Msi, '.wixpdb'))
 & (Join-Path $PSScriptRoot 'sign.ps1') $Msi
