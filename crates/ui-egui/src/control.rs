@@ -396,6 +396,148 @@ struct DeferredRequest {
     since: web_time::Instant,
 }
 
+/// A screenshot pending in the `finish_pending` pass, with ownership of its reply.
+struct PendingCapture {
+    slot: craft_ui::capture::CaptureSlot,
+    callback: Option<egui::ScreenshotCallback>,
+    region: Option<egui::Rect>,
+    reply: Sender<Reply>,
+    since: web_time::Instant,
+    geometry: Geometry,
+    reserved: usize,
+    attempts: u8,
+}
+
+impl PendingCapture {
+    fn into_pending(self) -> Pending {
+        Pending::Screenshot {
+            slot: self.slot,
+            callback: self.callback,
+            region: self.region,
+            reply: self.reply,
+            since: self.since,
+            geometry: self.geometry,
+            reserved: self.reserved,
+            attempts: self.attempts,
+        }
+    }
+}
+
+/// The state one `finish_pending` pass needs while resolving pending replies.
+struct PendingFinisher {
+    now: web_time::Instant,
+    passes: u64,
+    current: Geometry,
+    in_pass: bool,
+    dropped: Vec<u64>,
+    expired: Vec<u64>,
+    reserved_total: usize,
+}
+
+impl PendingFinisher {
+    /// Answer or keep one queued-input request, preserving its one arrival deadline.
+    fn resolve_frames(&self, until_pass: u64, batches: Vec<u64>, since: web_time::Instant, reply: Sender<Reply>, value: Value) -> Option<Pending> {
+        if batches.iter().any(|id| self.expired.contains(id)) {
+            let _ = reply.send(Err(not_drawn("handling the input")));
+            return None;
+        }
+        if batches.iter().any(|id| self.dropped.contains(id)) {
+            let _ = reply.send(Err("the document, dialog or focus changed before the input could be applied; nothing was done".into()));
+            return None;
+        }
+        if self.passes >= until_pass {
+            let _ = reply.send(Ok(value));
+            return None;
+        }
+        if !self.in_pass && self.now.duration_since(since) > timeout() {
+            let _ = reply.send(Err(not_drawn("handling the input")));
+            return None;
+        }
+        Some(Pending::Frames { until_pass, batches, since, reply, value })
+    }
+
+    /// Give one reservation back to the running aggregate budget.
+    fn release_reservation(&mut self, reserved: usize) {
+        self.reserved_total = self.reserved_total.saturating_sub(reserved);
+    }
+
+    /// Resolve one screenshot request, keeping it only while its capture is still pending.
+    fn finish_capture(&mut self, ctx: &egui::Context, capture: PendingCapture) -> Option<Pending> {
+        // Completion cannot restart or bypass the admission deadline, even when the callback
+        // arrived before this delayed tick or a resize would retry it.
+        if self.now.duration_since(capture.since) > timeout() {
+            capture.slot.cancel();
+            self.release_reservation(capture.reserved);
+            let _ = capture.reply.send(Err(not_drawn("the screenshot")));
+            return None;
+        }
+        match capture.slot.take() {
+            Some(Ok(image)) => self.finish_captured_image(ctx, capture, image),
+            Some(Err(error)) => {
+                self.release_reservation(capture.reserved);
+                let _ = capture.reply.send(Err(format!("the screenshot could not be captured: {error}")));
+                None
+            }
+            None => Some(capture.into_pending()),
+        }
+    }
+
+    /// Finish a screenshot whose callback produced an image.
+    fn finish_captured_image(&mut self, ctx: &egui::Context, capture: PendingCapture, image: Arc<egui::ColorImage>) -> Option<Pending> {
+        if self.current.epoch != capture.geometry.epoch {
+            // The document/dialog changed: never save a capture of the previous context, and do
+            // not retry it into the new one.
+            self.release_reservation(capture.reserved);
+            let _ = capture.reply.send(Err("the document or dialog changed while the screenshot was being captured; it was not saved".into()));
+            return None;
+        }
+        if self.current.size != capture.geometry.size || self.current.pixels_per_point != capture.geometry.pixels_per_point {
+            // A late completion after a resize/DPI change is never encoded: retry once with a
+            // fresh slot, else report a defined error.
+            return self.retry_captured_image(ctx, capture);
+        }
+        self.release_reservation(capture.reserved);
+        let _ = capture.reply.send(screenshot_png(&image, capture.region, capture.geometry));
+        None
+    }
+
+    /// Retry one resize/DPI-stale capture with the current geometry.
+    fn retry_captured_image(&mut self, ctx: &egui::Context, capture: PendingCapture) -> Option<Pending> {
+        if capture.attempts >= 1 {
+            self.release_reservation(capture.reserved);
+            let _ = capture.reply.send(Err("the window geometry changed while the screenshot was being captured; it was not saved".into()));
+            return None;
+        }
+        if capture.region.as_ref().is_some_and(|region| !self.current.contains_region(*region)) {
+            self.release_reservation(capture.reserved);
+            let _ = capture.reply.send(Err("the region must lie inside the window".into()));
+            return None;
+        }
+        let Some(bytes) = self.current.image_bytes() else {
+            self.release_reservation(capture.reserved);
+            let _ = capture.reply.send(Err("the window has no capturable size".into()));
+            return None;
+        };
+        let Some(new_total) = retried_reservation(self.reserved_total, capture.reserved, bytes) else {
+            self.release_reservation(capture.reserved);
+            let _ = capture.reply.send(Err("the screenshot no longer fits the screenshot budget".into()));
+            return None;
+        };
+        self.reserved_total = new_total;
+        let (slot, callback) = craft_ui::capture::CaptureSlot::new(ctx, egui::ViewportId::ROOT, MAX_IMAGE_BYTES);
+        Some(Pending::Screenshot {
+            slot,
+            callback: Some(callback),
+            region: capture.region,
+            reply: capture.reply,
+            since: capture.since,
+            geometry: self.current,
+            reserved: bytes,
+            attempts: capture.attempts + 1,
+        })
+    }
+}
+
 /// The app half: the request queue and requests waiting for later frames.
 pub struct Control {
     rx: Receiver<ControlRequest>,
@@ -615,7 +757,7 @@ impl Control {
         self.pending
             .iter()
             .filter_map(|p| if let Pending::Screenshot { reserved, .. } = p { Some(*reserved) } else { None })
-            .fold(0usize, |sum, bytes| sum.saturating_add(bytes))
+            .fold(0usize, usize::saturating_add)
     }
 
     fn pending_screenshots(&self) -> usize {
@@ -660,6 +802,33 @@ impl Control {
 
     fn finish_pending(&mut self, ctx: &egui::Context, host: &mut impl Host) {
         let now = web_time::Instant::now();
+        let (dropped, expired, in_pass) = self.take_finished_shared(ctx, host, now);
+        let mut finisher = PendingFinisher {
+            now,
+            passes: self.passes(),
+            current: Geometry::current(ctx, host.capture_epoch()),
+            in_pass,
+            dropped,
+            expired,
+            reserved_total: self.reserved_bytes(),
+        };
+        let mut keep = Vec::new();
+        for pending in std::mem::take(&mut self.pending) {
+            let kept = match pending {
+                Pending::Frames { until_pass, batches, since, reply, value } => finisher.resolve_frames(until_pass, batches, since, reply, value),
+                Pending::Screenshot { slot, callback, region, reply, since, geometry, reserved, attempts } => {
+                    finisher.finish_capture(ctx, PendingCapture { slot, callback, region, reply, since, geometry, reserved, attempts })
+                }
+            };
+            if let Some(pending) = kept {
+                keep.push(pending);
+            }
+        }
+        self.pending = keep;
+    }
+
+    /// Expire queued input and collect the batches a pending reply must react to.
+    fn take_finished_shared(&self, ctx: &egui::Context, host: &mut impl Host, now: web_time::Instant) -> (Vec<u64>, Vec<u64>, bool) {
         let (dropped, expired, in_pass) = self
             .shared
             .lock()
@@ -676,95 +845,7 @@ impl Control {
         if !expired.is_empty() {
             ctx.request_repaint(); // Run the queued key/modifier cleanup and pointer cancellation.
         }
-        let passes = self.passes();
-        let current = Geometry::current(ctx, host.capture_epoch());
-        let mut reserved_total = self.reserved_bytes();
-        let mut keep = Vec::new();
-        for p in self.pending.drain(..) {
-            match p {
-                Pending::Frames { until_pass, batches, since, reply, value } => {
-                    if batches.iter().any(|id| expired.contains(id)) {
-                        let _ = reply.send(Err(not_drawn("handling the input")));
-                    } else if batches.iter().any(|id| dropped.contains(id)) {
-                        let _ = reply.send(Err("the document, dialog or focus changed before the input could be applied; nothing was done".into()));
-                    } else if passes >= until_pass {
-                        let _ = reply.send(Ok(value));
-                    } else if !in_pass && now.duration_since(since) > timeout() {
-                        let _ = reply.send(Err(not_drawn("handling the input")));
-                    } else {
-                        keep.push(Pending::Frames { until_pass, batches, since, reply, value });
-                    }
-                }
-                Pending::Screenshot { slot, callback, region, reply, since, geometry, reserved, attempts } => {
-                    // Completion cannot restart or bypass the admission deadline, even when
-                    // the callback arrived before this delayed tick or a resize would retry it.
-                    if now.duration_since(since) > timeout() {
-                        slot.cancel();
-                        reserved_total = reserved_total.saturating_sub(reserved);
-                        let _ = reply.send(Err(not_drawn("the screenshot")));
-                        continue;
-                    }
-                    match slot.take() {
-                        Some(Ok(image)) => {
-                            if current.epoch != geometry.epoch {
-                                // The document/dialog changed: never save a capture of the
-                                // previous context, and do not retry it into the new one.
-                                reserved_total = reserved_total.saturating_sub(reserved);
-                                let _ = reply
-                                    .send(Err("the document or dialog changed while the screenshot was being captured; it was not saved".into()));
-                                continue;
-                            }
-                            if current.size != geometry.size || current.pixels_per_point != geometry.pixels_per_point {
-                                // A late completion after a resize/DPI change is never encoded:
-                                // retry once with a fresh slot, else report a defined error.
-                                if attempts < 1 {
-                                    if region.as_ref().is_some_and(|region| !current.contains_region(*region)) {
-                                        reserved_total = reserved_total.saturating_sub(reserved);
-                                        let _ = reply.send(Err("the region must lie inside the window".into()));
-                                        continue;
-                                    }
-                                    let Some(bytes) = current.image_bytes() else {
-                                        reserved_total = reserved_total.saturating_sub(reserved);
-                                        let _ = reply.send(Err("the window has no capturable size".into()));
-                                        continue;
-                                    };
-                                    let Some(new_total) = retried_reservation(reserved_total, reserved, bytes) else {
-                                        reserved_total = reserved_total.saturating_sub(reserved);
-                                        let _ = reply.send(Err("the screenshot no longer fits the screenshot budget".into()));
-                                        continue;
-                                    };
-                                    reserved_total = new_total;
-                                    let (new_slot, new_callback) = craft_ui::capture::CaptureSlot::new(ctx, egui::ViewportId::ROOT, MAX_IMAGE_BYTES);
-                                    keep.push(Pending::Screenshot {
-                                        slot: new_slot,
-                                        callback: Some(new_callback),
-                                        region,
-                                        reply,
-                                        since,
-                                        geometry: current,
-                                        reserved: bytes,
-                                        attempts: attempts + 1,
-                                    });
-                                } else {
-                                    reserved_total = reserved_total.saturating_sub(reserved);
-                                    let _ = reply
-                                        .send(Err("the window geometry changed while the screenshot was being captured; it was not saved".into()));
-                                }
-                                continue;
-                            }
-                            reserved_total = reserved_total.saturating_sub(reserved);
-                            let _ = reply.send(screenshot_png(&image, region, geometry));
-                        }
-                        Some(Err(error)) => {
-                            reserved_total = reserved_total.saturating_sub(reserved);
-                            let _ = reply.send(Err(format!("the screenshot could not be captured: {error}")));
-                        }
-                        None => keep.push(Pending::Screenshot { slot, callback, region, reply, since, geometry, reserved, attempts }),
-                    }
-                }
-            }
-        }
-        self.pending = keep;
+        (dropped, expired, in_pass)
     }
 
     fn passes(&self) -> u64 {
@@ -2033,6 +2114,7 @@ mod transport_tests {
 mod lifecycle_tests {
     use super::*;
     use egui::Plugin as _;
+    use egui_kittest::Harness;
 
     /// A request is answered after accepted frames only: a discarded layout pass is not a frame
     /// the agent can see, so it must not advance the count.
@@ -2540,178 +2622,214 @@ mod lifecycle_tests {
         }
     }
 
+    /// The public gestures this test drives through real UI passes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Gesture {
+        AtomicClick,
+        HeldClick,
+        Marquee,
+    }
+
+    fn gesture_request(gesture: Gesture, from: egui::Pos2, to: egui::Pos2) -> (&'static str, Value) {
+        match gesture {
+            Gesture::AtomicClick => ("ui.click", json!({"x": from.x, "y": from.y})),
+            Gesture::HeldClick => ("ui.drag", json!({"from": [from.x, from.y], "to": [from.x, from.y], "steps": 6})),
+            Gesture::Marquee => ("ui.drag", json!({"from": [from.x, from.y], "to": [to.x, to.y], "steps": 6})),
+        }
+    }
+
+    fn marquee_harness() -> (Harness<'static, crate::PdfCraftApp>, ControlClient) {
+        let client_slot: Arc<Mutex<Option<ControlClient>>> = Arc::new(Mutex::new(None));
+        let slot = client_slot.clone();
+        let h = Harness::builder().with_size(egui::vec2(1200.0, 900.0)).with_step_dt(0.01).build_eframe(move |cc| {
+            let mut app = crate::PdfCraftApp::new();
+            app.set_option("language", "en").unwrap();
+            app.open_bytes("synthetic-form.pdf", None, include_bytes!("../tests/data/form.pdf").to_vec()).unwrap();
+            app.set_option("quick", "marquee-zoom").unwrap();
+            *slot.lock().unwrap() = Some(app.attach_control(&cc.egui_ctx));
+            app
+        });
+        let client = client_slot.lock().unwrap().take().unwrap();
+        (h, client)
+    }
+
+    fn marquee_step(h: &mut Harness<'static, crate::PdfCraftApp>) {
+        let ctx = h.ctx.clone();
+        let mut raw = std::mem::take(h.input_mut());
+        h.state_mut().prepare_raw_input(&ctx, &mut raw);
+        *h.input_mut() = raw;
+        h.step();
+    }
+
+    /// The actual laid-out page rect and a short point gesture inside it.
+    fn gesture_target(h: &Harness<'static, crate::PdfCraftApp>) -> (egui::Pos2, egui::Pos2) {
+        let page = h.state().views[0].page_screen_rect(0).expect("the actual PDF page was laid out").intersect(h.state().views[0].viewport_rect());
+        assert!(page.width() > 100.0 && page.height() > 100.0, "a visible hit target: {page:?}");
+        let from = page.center();
+        let to = from + egui::vec2(40.0, 50.0);
+        assert!(page.contains(to));
+        (from, to)
+    }
+
+    /// Step until the public request has really reached egui and can still be interrupted.
+    fn await_gesture_admission(h: &mut Harness<'static, crate::PdfCraftApp>, gesture: Gesture) -> bool {
+        let mut admitted = false;
+        for _ in 0..8 {
+            marquee_step(h);
+            admitted = if gesture == Gesture::AtomicClick {
+                let shared = h.state().control.as_ref().unwrap().shared.lock().unwrap();
+                shared.inject.front().is_some_and(|request| request.started && request.batches.len() == 1)
+            } else {
+                h.ctx.input(|i| i.pointer.primary_down()) && (gesture != Gesture::Marquee || h.state().views[0].marquee.is_some())
+            };
+            if admitted {
+                break;
+            }
+        }
+        admitted
+    }
+
+    /// The request is queued exactly once, with the expected terminal batch not yet applied.
+    fn assert_interruptible_admission(h: &Harness<'static, crate::PdfCraftApp>, gesture: Gesture, from: egui::Pos2) {
+        {
+            let shared = h.state().control.as_ref().unwrap().shared.lock().unwrap();
+            assert_eq!(shared.inject.len(), 1, "only the actual public request is queued");
+            let pending = shared.inject.front().unwrap();
+            assert!(pending.started);
+            let terminal = pending.batches.back().expect("the terminal batch is still pending");
+            if gesture == Gesture::AtomicClick {
+                assert_eq!(pending.batches.len(), 1);
+                assert_eq!(terminal.len(), 2);
+                assert!(
+                    matches!(terminal[0], egui::Event::PointerButton { pressed: true, button: egui::PointerButton::Primary, pos, .. } if pos == from)
+                );
+                assert!(
+                    matches!(terminal[1], egui::Event::PointerButton { pressed: false, button: egui::PointerButton::Primary, pos, .. } if pos == from)
+                );
+                assert!(!h.ctx.input(|i| i.pointer.primary_down()), "atomic click has only hovered so far");
+            } else {
+                assert!(h.ctx.input(|i| i.pointer.primary_down()), "a real pass consumed the press");
+                assert_eq!(terminal.len(), 1);
+                assert!(matches!(terminal[0], egui::Event::PointerButton { pressed: false, button: egui::PointerButton::Primary, .. }));
+            }
+        }
+        assert!(!h.ctx.input(|i| i.pointer.any_released()), "the terminal release has not run");
+        assert!(h.ctx.drag_stopped_id().is_none());
+        if gesture == Gesture::Marquee {
+            assert!(h.ctx.dragged_id().is_some() && h.state().views[0].marquee.is_some(), "the app has a real drag preview");
+        } else {
+            assert!(h.state().views[0].marquee.is_none() && h.state().views[0].marquee_done.is_none());
+        }
+    }
+
+    /// Expire the admission both through hidden logic and through the next input hook, then
+    /// assert that cancellation left no gesture, zoom or edit behind.
+    fn assert_timed_out_gesture(h: &mut Harness<'static, crate::PdfCraftApp>, reply: &Receiver<Reply>, hidden_logic: bool, zoom: f32, bytes: &[u8]) {
+        age_input(h.state_mut().control.as_mut().unwrap());
+        if hidden_logic {
+            let ctx = h.ctx.clone();
+            let app = h.state_mut();
+            let mut control = app.control.take().unwrap();
+            control.tick(&ctx, app);
+            app.control = Some(control);
+            assert!(reply.try_recv().unwrap().unwrap_err().contains("not being drawn"));
+        }
+        marquee_step(h);
+        if !hidden_logic {
+            assert!(reply.try_recv().unwrap().unwrap_err().contains("not being drawn"));
+        }
+        for _ in 0..2 {
+            marquee_step(h);
+        }
+        assert!(!h.ctx.input(|i| i.pointer.any_down() || i.pointer.any_released()));
+        assert!(h.ctx.dragged_id().is_none() && h.ctx.drag_stopped_id().is_none());
+        assert!(h.state().views[0].marquee.is_none() && h.state().views[0].marquee_done.is_none());
+        assert_eq!(h.state().views[0].zoom, zoom, "canceling must not turn a drag into a zoom click");
+        assert_eq!(h.state().session.get(h.state().views[0].id).unwrap().bytes.as_slice(), bytes, "no abandoned edit");
+        assert!(h.state().control.as_ref().unwrap().shared.lock().unwrap().inject.is_empty());
+        assert!(h.state().control.as_ref().unwrap().pending.is_empty());
+        assert!(reply.try_recv().is_err(), "the cancellation replies once");
+    }
+
+    /// Complete one public gesture and check its real event trace and one-step zoom.
+    fn complete_positive_gesture(
+        h: &mut Harness<'static, crate::PdfCraftApp>,
+        client: &ControlClient,
+        gesture: Gesture,
+        positive: Gesture,
+        bytes: &[u8],
+    ) {
+        let (from, to) = gesture_target(h);
+        let zoom = h.state().views[0].zoom;
+        let (method, params) = gesture_request(positive, from, to);
+        let reply = client.send(method, params);
+        let mut value = None;
+        let mut buttons = Vec::new();
+        let mut positions = Vec::new();
+        for _ in 0..20 {
+            marquee_step(h);
+            h.ctx.input(|i| {
+                for event in &i.events {
+                    match event {
+                        egui::Event::PointerButton { button: egui::PointerButton::Primary, pressed, pos, .. } => {
+                            buttons.push((*pressed, i.time));
+                            positions.push(*pos);
+                        }
+                        egui::Event::PointerMoved(pos) => positions.push(*pos),
+                        _ => {}
+                    }
+                }
+            });
+            if let Ok(result) = reply.try_recv() {
+                value = Some(result.unwrap());
+                break;
+            }
+        }
+        assert!(value.is_some(), "a fresh completed request succeeds: {positive:?}, after {gesture:?}");
+        assert_eq!(buttons.iter().map(|(pressed, _)| *pressed).collect::<Vec<_>>(), [true, false]);
+        assert!(!h.ctx.input(|i| i.pointer.any_down()));
+        assert!(h.ctx.dragged_id().is_none());
+        if positive == Gesture::Marquee {
+            assert!(h.state().views[0].zoom > zoom, "the normal marquee rectangle zooms");
+        } else {
+            let options = h.ctx.options(|o| o.input_options);
+            assert!(buttons[1].1 - buttons[0].1 < options.max_click_duration, "real press/release remain a short click");
+            assert!(positions.iter().all(|pos| pos.distance(from) < options.max_click_dist), "real input remains stationary");
+            assert!((h.state().views[0].zoom - zoom * 1.5).abs() < 0.001, "a normal click zooms one step");
+        }
+        assert!(h.state().views[0].marquee.is_none() && h.state().views[0].marquee_done.is_none());
+        assert_eq!(h.state().session.get(h.state().views[0].id).unwrap().bytes.as_slice(), bytes, "completed zooms do not edit the document");
+        assert!(reply.try_recv().is_err(), "successful request replies once");
+    }
+
     /// Real page hit-testing, real control batches and the production marquee completion path.
     /// Exercise both hidden-logic expiry and expiry first observed by the next input hook.
     #[test]
     fn a_timed_out_marquee_never_zooms_and_completed_clicks_and_drags_still_work() {
-        use egui_kittest::Harness;
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        enum Gesture {
-            AtomicClick,
-            HeldClick,
-            Marquee,
-        }
-        let request = |gesture, from: egui::Pos2, to: egui::Pos2| match gesture {
-            Gesture::AtomicClick => ("ui.click", json!({"x": from.x, "y": from.y})),
-            Gesture::HeldClick => ("ui.drag", json!({"from": [from.x, from.y], "to": [from.x, from.y], "steps": 6})),
-            Gesture::Marquee => ("ui.drag", json!({"from": [from.x, from.y], "to": [to.x, to.y], "steps": 6})),
-        };
         for hidden_logic in [false, true] {
             for gesture in [Gesture::AtomicClick, Gesture::HeldClick, Gesture::Marquee] {
-                let client_slot = Arc::new(Mutex::new(None));
-                let slot = client_slot.clone();
-                let mut h = Harness::builder().with_size(egui::vec2(1200.0, 900.0)).with_step_dt(0.01).build_eframe(move |cc| {
-                    let mut app = crate::PdfCraftApp::new();
-                    app.set_option("language", "en").unwrap();
-                    app.open_bytes("synthetic-form.pdf", None, include_bytes!("../tests/data/form.pdf").to_vec()).unwrap();
-                    app.set_option("quick", "marquee-zoom").unwrap();
-                    *slot.lock().unwrap() = Some(app.attach_control(&cc.egui_ctx));
-                    app
-                });
-                let client = client_slot.lock().unwrap().take().unwrap();
-                let step = |h: &mut Harness<'_, crate::PdfCraftApp>| {
-                    let ctx = h.ctx.clone();
-                    let mut raw = std::mem::take(h.input_mut());
-                    h.state_mut().prepare_raw_input(&ctx, &mut raw);
-                    *h.input_mut() = raw;
-                    h.step();
-                };
-                let target = |h: &Harness<'_, crate::PdfCraftApp>| {
-                    let page = h.state().views[0]
-                        .page_screen_rect(0)
-                        .expect("the actual PDF page was laid out")
-                        .intersect(h.state().views[0].viewport_rect());
-                    assert!(page.width() > 100.0 && page.height() > 100.0, "a visible hit target: {page:?}");
-                    let from = page.center();
-                    let to = from + egui::vec2(40.0, 50.0);
-                    assert!(page.contains(to));
-                    (from, to)
-                };
+                let (mut h, client) = marquee_harness();
                 for _ in 0..5 {
-                    step(&mut h);
+                    marquee_step(&mut h);
                 }
-                let (from, to) = target(&h);
+                let (from, to) = gesture_target(&h);
                 let zoom = h.state().views[0].zoom;
                 let bytes = h.state().session.get(h.state().views[0].id).unwrap().bytes.clone();
-                let (method, params) = request(gesture, from, to);
+                let (method, params) = gesture_request(gesture, from, to);
                 let reply = client.send(method, params);
-                let mut admitted = false;
-                for _ in 0..8 {
-                    step(&mut h);
-                    admitted = if gesture == Gesture::AtomicClick {
-                        let shared = h.state().control.as_ref().unwrap().shared.lock().unwrap();
-                        shared.inject.front().is_some_and(|request| request.started && request.batches.len() == 1)
-                    } else {
-                        h.ctx.input(|i| i.pointer.primary_down()) && (gesture != Gesture::Marquee || h.state().views[0].marquee.is_some())
-                    };
-                    if admitted {
-                        break;
-                    }
-                }
-                assert!(admitted, "a real interruptible admission: {gesture:?}, hidden={hidden_logic}");
-                {
-                    let shared = h.state().control.as_ref().unwrap().shared.lock().unwrap();
-                    assert_eq!(shared.inject.len(), 1, "only the actual public request is queued");
-                    let pending = shared.inject.front().unwrap();
-                    assert!(pending.started);
-                    let terminal = pending.batches.back().expect("the terminal batch is still pending");
-                    if gesture == Gesture::AtomicClick {
-                        assert_eq!(pending.batches.len(), 1);
-                        assert_eq!(terminal.len(), 2);
-                        assert!(
-                            matches!(terminal[0], egui::Event::PointerButton { pressed: true, button: egui::PointerButton::Primary, pos, .. } if pos == from)
-                        );
-                        assert!(
-                            matches!(terminal[1], egui::Event::PointerButton { pressed: false, button: egui::PointerButton::Primary, pos, .. } if pos == from)
-                        );
-                        assert!(!h.ctx.input(|i| i.pointer.primary_down()), "atomic click has only hovered so far");
-                    } else {
-                        assert!(h.ctx.input(|i| i.pointer.primary_down()), "a real pass consumed the press");
-                        assert_eq!(terminal.len(), 1);
-                        assert!(matches!(terminal[0], egui::Event::PointerButton { pressed: false, button: egui::PointerButton::Primary, .. }));
-                    }
-                }
-                assert!(!h.ctx.input(|i| i.pointer.any_released()), "the terminal release has not run");
-                assert!(h.ctx.drag_stopped_id().is_none());
-                if gesture == Gesture::Marquee {
-                    assert!(h.ctx.dragged_id().is_some() && h.state().views[0].marquee.is_some(), "the app has a real drag preview");
-                } else {
-                    assert!(h.state().views[0].marquee.is_none() && h.state().views[0].marquee_done.is_none());
-                }
+                assert!(await_gesture_admission(&mut h, gesture), "a real interruptible admission: {gesture:?}, hidden={hidden_logic}");
+                assert_interruptible_admission(&h, gesture, from);
                 assert!(reply.try_recv().is_err(), "the terminal batch has not run");
                 assert_eq!(h.state().views[0].zoom, zoom);
                 assert_eq!(h.state().session.get(h.state().views[0].id).unwrap().bytes, bytes);
-                age_input(h.state_mut().control.as_mut().unwrap());
-                if hidden_logic {
-                    let ctx = h.ctx.clone();
-                    let app = h.state_mut();
-                    let mut control = app.control.take().unwrap();
-                    control.tick(&ctx, app);
-                    app.control = Some(control);
-                    assert!(reply.try_recv().unwrap().unwrap_err().contains("not being drawn"));
-                }
-                step(&mut h);
-                if !hidden_logic {
-                    assert!(reply.try_recv().unwrap().unwrap_err().contains("not being drawn"));
-                }
-                for _ in 0..2 {
-                    step(&mut h);
-                }
-                assert!(!h.ctx.input(|i| i.pointer.any_down() || i.pointer.any_released()));
-                assert!(h.ctx.dragged_id().is_none() && h.ctx.drag_stopped_id().is_none());
-                assert!(h.state().views[0].marquee.is_none() && h.state().views[0].marquee_done.is_none());
-                assert_eq!(h.state().views[0].zoom, zoom, "canceling must not turn a drag into a zoom click");
-                assert_eq!(h.state().session.get(h.state().views[0].id).unwrap().bytes, bytes, "no abandoned edit");
-                assert!(h.state().control.as_ref().unwrap().shared.lock().unwrap().inject.is_empty());
-                assert!(h.state().control.as_ref().unwrap().pending.is_empty());
-                assert!(reply.try_recv().is_err(), "the cancellation replies once");
+                assert_timed_out_gesture(&mut h, &reply, hidden_logic, zoom, &bytes);
 
                 // Complete the same public gesture, then an atomic click after held input.
                 // Real event traces prove the stationary drag is a valid short point click.
                 let positives = [gesture, Gesture::AtomicClick];
                 let count = if gesture == Gesture::AtomicClick { 1 } else { 2 };
                 for positive in positives.into_iter().take(count) {
-                    let (from, to) = target(&h);
-                    let zoom = h.state().views[0].zoom;
-                    let (method, params) = request(positive, from, to);
-                    let reply = client.send(method, params);
-                    let mut value = None;
-                    let mut buttons = Vec::new();
-                    let mut positions = Vec::new();
-                    for _ in 0..20 {
-                        step(&mut h);
-                        h.ctx.input(|i| {
-                            for event in &i.events {
-                                match event {
-                                    egui::Event::PointerButton { button: egui::PointerButton::Primary, pressed, pos, .. } => {
-                                        buttons.push((*pressed, i.time));
-                                        positions.push(*pos);
-                                    }
-                                    egui::Event::PointerMoved(pos) => positions.push(*pos),
-                                    _ => {}
-                                }
-                            }
-                        });
-                        if let Ok(result) = reply.try_recv() {
-                            value = Some(result.unwrap());
-                            break;
-                        }
-                    }
-                    assert!(value.is_some(), "a fresh completed request succeeds: {positive:?}, after {gesture:?}");
-                    assert_eq!(buttons.iter().map(|(pressed, _)| *pressed).collect::<Vec<_>>(), [true, false]);
-                    assert!(!h.ctx.input(|i| i.pointer.any_down()));
-                    assert!(h.ctx.dragged_id().is_none());
-                    if positive == Gesture::Marquee {
-                        assert!(h.state().views[0].zoom > zoom, "the normal marquee rectangle zooms");
-                    } else {
-                        let options = h.ctx.options(|o| o.input_options);
-                        assert!(buttons[1].1 - buttons[0].1 < options.max_click_duration, "real press/release remain a short click");
-                        assert!(positions.iter().all(|pos| pos.distance(from) < options.max_click_dist), "real input remains stationary");
-                        assert!((h.state().views[0].zoom - zoom * 1.5).abs() < 0.001, "a normal click zooms one step");
-                    }
-                    assert!(h.state().views[0].marquee.is_none() && h.state().views[0].marquee_done.is_none());
-                    assert_eq!(h.state().session.get(h.state().views[0].id).unwrap().bytes, bytes, "completed zooms do not edit the document");
-                    assert!(reply.try_recv().is_err(), "successful request replies once");
+                    complete_positive_gesture(&mut h, &client, gesture, positive, &bytes);
                 }
             }
         }
