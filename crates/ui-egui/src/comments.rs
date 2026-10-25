@@ -257,7 +257,14 @@ pub struct CommentPrefs {
     pub group_tool: [CommentTool; 3],
     /// Hide hover previews on highlight annotations when they contain no comment text beyond the author.
     pub hide_empty_highlight_hover: bool,
+    /// Point size of comment text in the Comments panel (Acrobat: Preferences ▸ Commenting ▸
+    /// Font size); the cards' other text follows it. Set through `set_text_size`, which clamps.
+    text_size: f32,
 }
+
+/// The Comments panel's comment text size: default and range, in points.
+pub const TEXT_SIZE_DEFAULT: f32 = 13.0;
+pub const TEXT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 9.0..=28.0;
 
 impl Default for CommentPrefs {
     fn default() -> Self {
@@ -267,11 +274,29 @@ impl Default for CommentPrefs {
             pinned: false,
             group_tool: [CommentTool::Note, CommentTool::Highlight, CommentTool::Ink],
             hide_empty_highlight_hover: false,
+            text_size: TEXT_SIZE_DEFAULT,
         }
     }
 }
 
 impl CommentPrefs {
+    /// The Comments panel's comment text size, in points.
+    pub fn text_size(&self) -> f32 {
+        self.text_size
+    }
+
+    /// Set the comment text size, clamped to `TEXT_SIZE_RANGE`; NaN or infinity is ignored.
+    pub fn set_text_size(&mut self, pt: f32) {
+        if pt.is_finite() {
+            self.text_size = pt.clamp(*TEXT_SIZE_RANGE.start(), *TEXT_SIZE_RANGE.end());
+        }
+    }
+
+    /// A card font of `pt` points at the default size, scaled to the chosen text size.
+    pub(crate) fn card_size(&self, pt: f32) -> f32 {
+        pt * self.text_size / TEXT_SIZE_DEFAULT
+    }
+
     pub fn style(&self, tool: CommentTool) -> Style {
         self.styles.iter().find(|(t, _)| *t == tool).map(|(_, s)| s.clone()).unwrap_or_default()
     }

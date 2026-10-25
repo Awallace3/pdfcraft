@@ -897,6 +897,89 @@ fn the_panel_posts_comments_and_replies() {
     h.get_by_label_contains("Agreed");
 }
 
+/// J and K step through the panel's cards as a click would, stop at the ends, skip a folded
+/// page group, and leave the keys to a text field that has the keyboard.
+#[test]
+fn j_and_k_step_through_the_comment_cards() {
+    let mut h = harness(|app| {
+        app.set_option("panel", "comments").unwrap();
+        for (page, text) in [(0, "First note"), (0, "Second note"), (1, "Third note")] {
+            let shape = pdfcraft_engine::Shape::Note { at: [150.0, 90.0], icon: pdfcraft_engine::NoteIcon::Comment };
+            assert!(app.apply_edit(pdfcraft_engine::Edit::AddAnnotation(pdfcraft_engine::NewAnnotation {
+                page,
+                style: pdfcraft_engine::Style::default_for(&shape),
+                shape,
+                contents: text.into(),
+                author: "Tester".into(),
+            })));
+        }
+        app.views[0].comments.selected = None;
+    });
+    // A sticky note brings its popup along, so the cards' indices aren't 0, 1, 2.
+    let key = |h: &Harness<'static, PdfCraftApp>, text: &str| {
+        comments(h).iter().find(|a| a.contents.as_deref() == Some(text)).map(|a| (a.page, a.index)).expect("the note")
+    };
+    let (first, second, third) = (key(&h, "First note"), key(&h, "Second note"), key(&h, "Third note"));
+    let press = |h: &mut Harness<'static, PdfCraftApp>, key| {
+        h.key_press(key);
+        h.run_steps(3);
+        h.state().views[0].comments.selected
+    };
+    assert_eq!(press(&mut h, egui::Key::J), Some(first), "J starts at the first card");
+    assert_eq!(press(&mut h, egui::Key::J), Some(second));
+    assert_eq!(press(&mut h, egui::Key::J), Some(third));
+    assert_eq!(press(&mut h, egui::Key::J), Some(third), "the list doesn't wrap");
+    assert_eq!(press(&mut h, egui::Key::K), Some(second));
+    h.state_mut().views[0].comments.selected = None;
+    assert_eq!(press(&mut h, egui::Key::K), Some(third), "K starts at the last card");
+    // A folded page group is skipped.
+    h.state_mut().views[0].comments.collapsed_pages = vec![0];
+    h.state_mut().views[0].comments.selected = None;
+    assert_eq!(press(&mut h, egui::Key::J), Some(third));
+    assert_eq!(press(&mut h, egui::Key::K), Some(third), "nothing before it is drawn");
+    assert_eq!(h.state().views[0].comments.collapsed_pages, vec![0], "the folded group stays folded");
+    // Typing in the panel's own field keeps the keys.
+    field(&h, "Add a comment").click();
+    h.run_steps(2);
+    assert_eq!(press(&mut h, egui::Key::J), Some(third));
+    h.state_mut().views[0].comments.collapsed_pages.clear();
+    assert_eq!(press(&mut h, egui::Key::K), Some(third), "the text field has the keyboard");
+}
+
+/// The comment text size enlarges the panel's cards and nothing else, survives a restart, and
+/// rejects or clamps bad values.
+#[test]
+fn the_comment_text_size_scales_only_the_cards() {
+    let mut h = harness(|app| {
+        app.set_option("panel", "comments").unwrap();
+        let shape = pdfcraft_engine::Shape::Note { at: [150.0, 90.0], icon: pdfcraft_engine::NoteIcon::Comment };
+        assert!(app.apply_edit(pdfcraft_engine::Edit::AddAnnotation(pdfcraft_engine::NewAnnotation {
+            page: 0,
+            style: pdfcraft_engine::Style::default_for(&shape),
+            shape,
+            contents: "Sized note".into(),
+            author: "Tester".into(),
+        })));
+        app.views[0].comments.selected = None;
+    });
+    let heights = |h: &Harness<'static, PdfCraftApp>| (h.get_by_label("Sized note").rect().height(), field(h, "Add a comment").rect().height());
+    let (body, add_box) = heights(&h);
+    h.state_mut().set_option("comment-text-size", "26").expect("a valid size");
+    h.run_steps(4);
+    let (bigger, same_box) = heights(&h);
+    assert!(bigger > body * 1.6, "the comment text grew: {body} → {bigger}");
+    assert_eq!(add_box, same_box, "the rest of the panel keeps its size");
+    let mut restarted = PdfCraftApp::new();
+    restarted.restore(&h.state().persist());
+    assert_eq!(restarted.comment_prefs.text_size(), 26.0);
+    restarted.restore(r#"{"comment_text_size": 1e30}"#);
+    assert_eq!(restarted.comment_prefs.text_size(), *pdfcraft_ui_egui::comments::TEXT_SIZE_RANGE.end(), "a hostile size is clamped");
+    for bad in ["big", "NaN", "inf", ""] {
+        assert!(h.state_mut().set_option("comment-text-size", bad).is_err(), "{bad:?} is rejected");
+    }
+    assert_eq!(h.state().comment_prefs.text_size(), 26.0, "a rejected value changes nothing");
+}
+
 /// The side panel's width as egui keeps it from one frame to the next.
 fn panel_width(h: &Harness<'static, PdfCraftApp>) -> f32 {
     h.ctx.data(|data| data.get_temp::<egui::Rect>(egui::Id::new("pdfcraft-inspector-body"))).expect("the inspector body is shown").width()

@@ -481,6 +481,15 @@ pub(crate) fn preferences_body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tok
         ui.add(crate::widgets::line(&mut app.comment_prefs.author).desired_width(220.0).char_limit(crate::MAX_AUTHOR_CHARS)).labelled_by(label.id);
     });
     ui.add(widgets::checkbox(&mut app.comment_prefs.hide_empty_highlight_hover, tl!("Hide hover previews for highlights without comment text")));
+    // Acrobat: Preferences ▸ Commenting ▸ Font size. Only the Comments panel's cards follow it.
+    ui.horizontal(|ui| {
+        let label = ui.label(tl!("Comment text size"));
+        let mut pt = app.comment_prefs.text_size();
+        let range = crate::comments::TEXT_SIZE_RANGE;
+        if ui.add(egui::DragValue::new(&mut pt).range(range).speed(0.25).max_decimals(1).suffix(" pt")).labelled_by(label.id).changed() {
+            app.comment_prefs.set_text_size(pt);
+        }
+    });
     ui.add_space(8.0);
     ui.label(egui::RichText::new(tl!("Fill & Sign")).font(theme::semibold(13.0)));
     ui.add(widgets::checkbox(&mut app.flatten_fill_sign_on_save, tl!("Flatten Fill & Sign when saving")));

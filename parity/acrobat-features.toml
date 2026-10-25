@@ -3560,8 +3560,8 @@ milestone = "M3"
 status = "shipped"
 commands = ["comment.list"]
 tools = ["comment_list"]
-evidence = ["crates/ui-egui/tests/it/ui.rs::opening_a_pdf_shows_comments_and_bookmarks", "crates/ui-egui/tests/it/comments.rs::the_panel_posts_comments_and_replies", "crates/ui-egui/tests/it/comments.rs::page_groups_collapse_and_expand"]
-notes = "cards grouped by page with replies, status badges, selection, reply box and an Add a comment box; page groups fold and unfold from their chevron or with Collapse/Expand all pages in the panel's \"…\" menu (a comment selected on a folded page opens its group). Groups by author, type or colour don't fold yet"
+evidence = ["crates/ui-egui/tests/it/ui.rs::opening_a_pdf_shows_comments_and_bookmarks", "crates/ui-egui/tests/it/comments.rs::the_panel_posts_comments_and_replies", "crates/ui-egui/tests/it/comments.rs::page_groups_collapse_and_expand", "crates/ui-egui/tests/it/comments.rs::j_and_k_step_through_the_comment_cards", "crates/ui-egui/tests/it/comments.rs::the_comment_text_size_scales_only_the_cards"]
+notes = "cards grouped by page with replies, status badges, selection, reply box and an Add a comment box; page groups fold and unfold from their chevron or with Collapse/Expand all pages in the panel's \"…\" menu (a comment selected on a folded page opens its group). J and K select the next and previous card as a click would (showing the comment on the page), skipping folded groups and not wrapping; a pdfcraft addition, not an Acrobat key. Preferences ▸ Comment text size (9–28 pt, persisted; set_option comment-text-size) enlarges the cards' text, editor and reply box without the rest of the UI, like Acrobat's Commenting ▸ Font size; Acrobat's Font family choice isn't offered. Groups by author, type or colour don't fold yet"
 
 [[feature]]
 id = "comment.appearance-generation"

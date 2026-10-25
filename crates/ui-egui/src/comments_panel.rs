@@ -3,6 +3,7 @@
 //! Header "Comments N" with search; an "Add a comment" box that posts a sticky note on the
 //! current page; cards grouped by page. Selecting a card selects the comment on the page and
 //! opens its reply box and "…" menu (Edit, Set status, Delete). Status replies show as a badge.
+//! J and K select the next and previous card, as a click on it would.
 
 use std::collections::HashMap;
 
@@ -102,7 +103,22 @@ fn any_contains<'a>(fields: impl IntoIterator<Item = &'a str>, q: &str) -> bool 
     fields.into_iter().any(|s| pdfcraft_render::text::fold_case(s).contains(&q))
 }
 
-/// Draw the panel body. Returns an edit to apply (posting, replying, deleting…).
+/// The card after (`forward`) or before the selected one in `order`, the cards as drawn. With
+/// none of them selected, the first or the last; at either end, none (the list doesn't wrap).
+fn step<K: PartialEq + Copy>(order: &[K], selected: Option<K>, forward: bool) -> Option<K> {
+    let at = selected.and_then(|s| order.iter().position(|&k| k == s));
+    let next = match (at, forward) {
+        (None, true) => Some(0),
+        (None, false) => order.len().checked_sub(1),
+        (Some(i), true) => i.checked_add(1),
+        (Some(i), false) => i.checked_sub(1),
+    };
+    next.and_then(|i| order.get(i).copied())
+}
+
+/// Draw the panel body. Returns an edit to apply (posting, replying, deleting…). `modal`: a
+/// dialog or the palette has the keyboard, so J and K are theirs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn show(
     ui: &mut egui::Ui,
     t: &Tokens,
@@ -110,6 +126,7 @@ pub(crate) fn show(
     view: &mut DocView,
     prefs: &CommentPrefs,
     allowed: bool,
+    modal: bool,
     nav: &mut Option<Nav>,
 ) -> Option<Edit> {
     crate::widgets::begin_dialog(ui);
@@ -208,6 +225,25 @@ pub(crate) fn show(
             SortBy::Date => None,
         }
     };
+    // J and K select the next and previous card drawn (not those in a folded page group), as a
+    // click would. Plain letters, so not while a text field, a form field or a dialog has the keyboard.
+    let free = !modal && !ui.ctx().egui_wants_keyboard_input() && view.forms.focus.is_none();
+    let (next, prev) = if free {
+        ui.input_mut(|i| (i.consume_key(egui::Modifiers::NONE, egui::Key::J), i.consume_key(egui::Modifiers::NONE, egui::Key::K)))
+    } else {
+        (false, false)
+    };
+    if next != prev {
+        let drawn: Vec<&Annotation> =
+            roots.iter().copied().filter(|a| sort != SortBy::Page || !view.comments.collapsed_pages.contains(&a.page)).collect();
+        let order: Vec<(usize, usize)> = drawn.iter().map(|a| (a.page, a.index)).collect();
+        if let Some(a) = step(&order, view.comments.selected, next).and_then(|k| drawn.iter().find(|a| (a.page, a.index) == k)) {
+            view.comments.selected = Some((a.page, a.index));
+            view.comments.reply.clear();
+            view.comments.reveal = true;
+            *nav = Some(Nav::Flash(a.page, a.rect));
+        }
+    }
     // A comment selected elsewhere (on the page, or just added) opens its folded group, or the
     // card it should scroll to would not be drawn.
     if view.comments.reveal
@@ -304,9 +340,9 @@ fn card(
             let head = ui.horizontal(|ui| {
                 avatar(ui, t, Some(subtype_icon(&a.subtype)), None, color);
                 let author = a.author.as_deref().map_or_else(|| tl!("Unknown author").into(), crate::bidi::visual_auto);
-                ui.label(egui::RichText::new(author).font(theme::semibold(12.5)).color(t.text));
+                ui.label(egui::RichText::new(author).font(theme::semibold(prefs.card_size(12.5))).color(t.text));
                 if let Some(m) = &a.modified {
-                    ui.add(egui::Label::new(egui::RichText::new(m).font(theme::regular(11.0)).color(t.text_faint)).truncate());
+                    ui.add(egui::Label::new(egui::RichText::new(m).font(theme::regular(prefs.card_size(11.0))).color(t.text_faint)).truncate());
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if selected && allowed {
@@ -332,7 +368,13 @@ fn card(
             egui::Frame::NONE.inner_margin(egui::Margin { left: 34, right: 0, top: 4, bottom: 0 }).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 if editing && let Some((_, _, text)) = view.comments.editing.as_mut() {
-                    let r = ui.add(crate::widgets::block(text).desired_rows(2).desired_width(f32::INFINITY).id_salt(("comment-edit", key)));
+                    let r = ui.add(
+                        crate::widgets::block(text)
+                            .font(theme::regular(prefs.card_size(13.0)))
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY)
+                            .id_salt(("comment-edit", key)),
+                    );
                     match view.comments.editor_focus.take() {
                         Some(crate::comments::EditorFocus::Take) => r.request_focus(),
                         Some(crate::comments::EditorFocus::Release) => r.surrender_focus(),
@@ -355,21 +397,21 @@ fn card(
                 } else {
                     let body = a.contents.as_deref().unwrap_or("");
                     if body.is_empty() {
-                        let text = egui::RichText::new(tl!(kind_label(a))).italics().color(t.text_faint).font(theme::regular(13.0));
+                        let text = egui::RichText::new(tl!(kind_label(a))).italics().color(t.text_faint).font(theme::regular(prefs.card_size(13.0)));
                         let mut label = egui::Label::new(text).wrap();
                         if !selected {
                             label = label.truncate();
                         }
                         ui.add(label);
                     } else {
-                        widgets::wrapped_text(ui, body, theme::regular(13.0), t.text, !selected);
+                        widgets::wrapped_text(ui, body, theme::regular(prefs.card_size(13.0)), t.text, !selected);
                     }
                 }
                 if let Some((icon, label, c)) = status.and_then(status_badge) {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.add(icons::image(icon, 13.0, c));
-                        ui.label(egui::RichText::new(tl!(label)).font(theme::medium(11.5)).color(c));
+                        ui.label(egui::RichText::new(tl!(label)).font(theme::medium(prefs.card_size(11.5))).color(c));
                     });
                 }
             });
@@ -382,12 +424,15 @@ fn card(
                         ui.spacing_mut().item_spacing.y = 2.0;
                         ui.horizontal(|ui| {
                             let author = r.author.as_deref().map_or_else(|| tl!("Reply").into(), crate::bidi::visual_auto);
-                            ui.label(egui::RichText::new(author).font(theme::semibold(12.0)));
+                            ui.label(egui::RichText::new(author).font(theme::semibold(prefs.card_size(12.0))));
                             if let Some(m) = &r.modified {
-                                ui.add(egui::Label::new(egui::RichText::new(m).font(theme::regular(11.0)).color(t.text_faint)).truncate());
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(m).font(theme::regular(prefs.card_size(11.0))).color(t.text_faint))
+                                        .truncate(),
+                                );
                             }
                         });
-                        widgets::wrapped_text(ui, r.contents.as_deref().unwrap_or(""), theme::regular(12.5), t.text, false);
+                        widgets::wrapped_text(ui, r.contents.as_deref().unwrap_or(""), theme::regular(prefs.card_size(12.5)), t.text, false);
                     });
                 });
                 let x = resp.response.rect.left() + 12.0;
@@ -401,6 +446,7 @@ fn card(
                     // would widen the resizable panel again on every repaint.
                     let r = ui.add(
                         crate::widgets::block(&mut view.comments.reply)
+                            .font(theme::regular(prefs.card_size(13.0)))
                             .desired_rows(1)
                             .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter))
                             .hint_text(tl!("Add a reply"))
@@ -648,6 +694,26 @@ pub(crate) fn header_controls(ui: &mut egui::Ui, info: &DocInfo, view: &mut DocV
         }
     });
     command
+}
+
+#[cfg(test)]
+mod keys {
+    use super::step;
+
+    #[test]
+    fn j_and_k_step_through_the_cards_without_wrapping() {
+        let order = [10, 20, 30];
+        assert_eq!(step(&order, None, true), Some(10));
+        assert_eq!(step(&order, None, false), Some(30));
+        assert_eq!(step(&order, Some(10), true), Some(20));
+        assert_eq!(step(&order, Some(20), false), Some(10));
+        assert_eq!(step(&order, Some(30), true), None);
+        assert_eq!(step(&order, Some(10), false), None);
+        // A selection filtered out of the list starts over, as no selection does.
+        assert_eq!(step(&order, Some(99), true), Some(10));
+        assert_eq!(step::<i32>(&[], None, true), None);
+        assert_eq!(step::<i32>(&[], None, false), None);
+    }
 }
 
 #[cfg(test)]

@@ -2430,6 +2430,7 @@ impl PdfCraftApp {
         v["redact_prefs"] = self.redact_defaults.to_json();
         // Set outside json! above, which is at serde_json's macro recursion limit.
         v["hide_empty_highlight_hover"] = serde_json::Value::Bool(self.comment_prefs.hide_empty_highlight_hover);
+        v["comment_text_size"] = serde_json::json!(self.comment_prefs.text_size());
         v["organize_zoom"] = serde_json::json!(self.organize_zoom);
         // Canonical names survive changes to the order of PAPERS and do not depend on UI language.
         v["print_paper"] = serde_json::json!(pdfcraft_engine::print::PAPERS.get(self.print_draft.paper).map(|(name, _)| *name));
@@ -2553,6 +2554,10 @@ impl PdfCraftApp {
         }
         if let Some(hide) = v["hide_empty_highlight_hover"].as_bool() {
             self.comment_prefs.hide_empty_highlight_hover = hide;
+        }
+        // Clamped by the setter: settings are untrusted.
+        if let Some(pt) = v["comment_text_size"].as_f64() {
+            self.comment_prefs.set_text_size(pt as f32);
         }
         // Per-tool comment styles (#340): each field goes through its clamping setter, so a
         // malformed or hostile entry is clamped or ignored rather than trusted.
@@ -2901,6 +2906,13 @@ impl PdfCraftApp {
                     "false" => false,
                     _ => return Err("hide-empty-highlight-hover must be true or false".into()),
                 };
+            }
+            ("comment-text-size", _) => {
+                let pt: f32 = value.trim().parse().map_err(|_| format!("comment-text-size must be a number of points, not {value:?}"))?;
+                if !pt.is_finite() {
+                    return Err("comment-text-size must be a finite number of points".into());
+                }
+                self.comment_prefs.set_text_size(pt);
             }
             ("ui-scale", _) => self.ui_scale = ui_scale::parse(value)?,
             ("system-title-bar", _) => {
